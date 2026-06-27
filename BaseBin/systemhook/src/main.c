@@ -440,6 +440,14 @@ roothide_init_with_executable(gExecutablePath);
 			}
 		}
 
+		// iOSSpoof system-level hooks — runs for ALL apps, even blacklisted ones
+		// Uses litehook (instruction patching), no substrate/ellekit needed
+		// Invisible to app: no MSHookFunction pattern, no dyld injection
+		{
+			extern void iosspoof_system_init(void);
+			iosspoof_system_init();
+		}
+
 #ifndef __arm64e__
 		// Feeable attempt at adding back CS_VALID
 		jbclient_cs_revalidate();
