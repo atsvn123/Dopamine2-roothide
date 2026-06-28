@@ -94,6 +94,27 @@
 		<dict>
 			<key>cell</key>
 			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>iosSpoof</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>headerCellClass</key>
+			<string>DOCreditsCell</string>
+			<key>names</key>
+			<array>
+				<dict>
+					<key>name</key>
+					<string>iosSpoof tweak + systemhook</string>
+					<key>link</key>
+					<string>https://github.com/roothide/Dopamine2-roothide</string>
+				</dict>
+			</array>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
 			<key>headerCellClass</key>
 			<string>DOCreditsCell</string>
 			<key>names</key>

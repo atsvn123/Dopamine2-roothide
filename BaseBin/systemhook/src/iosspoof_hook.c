@@ -11,12 +11,20 @@
 #include <sys/utsname.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
+#include <sys/statvfs.h>
+#include <sys/time.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <spawn.h>
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
+#include <time.h>
+#include <objc/runtime.h>
+#include <objc/message.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <UIKit/UIKit.h>
+#include <SystemConfiguration/SystemConfiguration.h>
 
 #include "litehook.h"
 #include "common.h"
@@ -376,6 +384,294 @@ int sc_task_for_pid_hook(pid_t pid, mach_port_t *t) {
 }
 
 // ============================================================================
+// statfs / statvfs — storage spoof
+// ============================================================================
+
+static unsigned long long sc_fake_total_bytes = 0;
+static unsigned long long sc_fake_free_bytes = 0;
+
+static void sc_calc_storage(void) {
+    if (sc_fake_total_bytes > 0) return;
+    // Default: 256GB total, 85GB free
+    sc_fake_total_bytes = 256ULL * 1024ULL * 1024ULL * 1024ULL;
+    sc_fake_free_bytes = 85ULL * 1024ULL * 1024ULL * 1024ULL;
+}
+
+int (*orig_statfs_sc)(const char *, struct statfs *);
+int sc_statfs_hook(const char *path, struct statfs *buf) {
+    int r = orig_statfs_sc(path, buf);
+    if (r == 0 && sc_should_spoof() && buf) {
+        sc_calc_storage();
+        if (buf->f_bsize > 0) {
+            buf->f_blocks = sc_fake_total_bytes / buf->f_bsize;
+            buf->f_bfree = sc_fake_free_bytes / buf->f_bsize;
+            buf->f_bavail = sc_fake_free_bytes / buf->f_bsize;
+        }
+    }
+    return r;
+}
+
+int (*orig_statvfs_sc)(const char *, struct statvfs *);
+int sc_statvfs_hook(const char *path, struct statvfs *buf) {
+    int r = orig_statvfs_sc(path, buf);
+    if (r == 0 && sc_should_spoof() && buf) {
+        sc_calc_storage();
+        if (buf->f_frsize > 0) {
+            buf->f_blocks = sc_fake_total_bytes / buf->f_frsize;
+            buf->f_bfree = sc_fake_free_bytes / buf->f_frsize;
+            buf->f_bavail = sc_fake_free_bytes / buf->f_frsize;
+        }
+    }
+    return r;
+}
+
+// ============================================================================
+// uname — device identity
+// ============================================================================
+
+int (*orig_uname_sc)(struct utsname *);
+int sc_uname_hook(struct utsname *buf) {
+    int r = orig_uname_sc(buf);
+    if (r == 0 && sc_should_spoof()) {
+        strlcpy(buf->machine, sc_productType, sizeof(buf->machine));
+        strlcpy(buf->nodename, "iPhone", sizeof(buf->nodename));
+    }
+    return r;
+}
+
+// ============================================================================
+// readlink / realpath — hide jbroot symlinks
+// ============================================================================
+
+ssize_t (*orig_readlink_sc)(const char *, char *, size_t);
+ssize_t sc_readlink_hook(const char *path, char *buf, size_t bufsize) {
+    ssize_t r = orig_readlink_sc(path, buf, bufsize);
+    if (r > 0 && sc_should_spoof() && sc_hideJailbreak && path) {
+        if (strstr(path, "/var/jb") || strstr(path, "/private/preboot")) {
+            if (strstr(buf, "/var/jb") || strstr(buf, "jbroot") || strstr(buf, "substrate") || strstr(buf, "ellekit")) {
+                strlcpy(buf, "/usr/lib", bufsize);
+                r = strlen(buf);
+            }
+        }
+    }
+    return r;
+}
+
+char *(*orig_realpath_sc)(const char *, char *);
+char *sc_realpath_hook(const char *path, char *resolved) {
+    char *r = orig_realpath_sc(path, resolved);
+    if (r && sc_should_spoof() && sc_hideJailbreak && path) {
+        if (strstr(path, "/var/jb") || strstr(path, "/private/preboot")) {
+            if (strstr(r, "/var/jb") || strstr(r, "jbroot") || strstr(r, "/private/preboot")) {
+                strlcpy(r, path, PATH_MAX);
+            }
+        }
+    }
+    return r;
+}
+
+// ============================================================================
+// time / gettimeofday — timestamp spoof
+// ============================================================================
+
+static long sc_timestamp_offset = 0;
+
+time_t (*orig_time_sc)(time_t *);
+time_t sc_time_hook(time_t *t) {
+    time_t r = orig_time_sc(t);
+    if (sc_should_spoof() && sc_timestamp_offset != 0) {
+        r += sc_timestamp_offset;
+        if (t) *t = r;
+    }
+    return r;
+}
+
+int (*orig_gettimeofday_sc)(struct timeval *, struct timezone *);
+int sc_gettimeofday_hook(struct timeval *tv, struct timezone *tz) {
+    int r = orig_gettimeofday_sc(tv, tz);
+    if (r == 0 && sc_should_spoof() && sc_timestamp_offset != 0 && tv) {
+        tv->tv_sec += sc_timestamp_offset;
+    }
+    return r;
+}
+
+// ============================================================================
+// ObjC hooks — use method_exchangeImplementations (NOT MSHookFunction)
+// This is invisible to banking apps — no instruction pattern to detect
+// ============================================================================
+
+// UIDevice
+static NSString *(*orig_UIDevice_model)(id, SEL);
+static NSString *sc_UIDevice_model(id self, SEL _cmd) {
+    if (sc_should_spoof()) return @"iPhone";
+    return orig_UIDevice_model(self, _cmd);
+}
+
+static NSString *(*orig_UIDevice_localizedModel)(id, SEL);
+static NSString *sc_UIDevice_localizedModel(id self, SEL _cmd) {
+    if (sc_should_spoof()) return [NSString stringWithUTF8String:sc_marketingName];
+    return orig_UIDevice_localizedModel(self, _cmd);
+}
+
+static NSString *(*orig_UIDevice_systemVersion)(id, SEL);
+static NSString *sc_UIDevice_systemVersion(id self, SEL _cmd) {
+    if (sc_should_spoof()) return [NSString stringWithUTF8String:sc_systemVersion];
+    return orig_UIDevice_systemVersion(self, _cmd);
+}
+
+// NSProcessInfo
+static NSString *(*orig_NSProcessInfo_operatingSystemVersionString)(id, SEL);
+static NSString *sc_NSProcessInfo_operatingSystemVersionString(id self, SEL _cmd) {
+    if (sc_should_spoof()) {
+        return [NSString stringWithFormat:@"Version %s (Build %s)", sc_systemVersion, sc_buildID];
+    }
+    return orig_NSProcessInfo_operatingSystemVersionString(self, _cmd);
+}
+
+static uint64_t (*orig_NSProcessInfo_physicalMemory)(id, SEL);
+static uint64_t sc_NSProcessInfo_physicalMemory(id self, SEL _cmd) {
+    if (sc_should_spoof()) return 6ULL * 1024ULL * 1024ULL * 1024ULL;
+    return orig_NSProcessInfo_physicalMemory(self, _cmd);
+}
+
+static NSUInteger (*orig_NSProcessInfo_processorCount)(id, SEL);
+static NSUInteger sc_NSProcessInfo_processorCount(id self, SEL _cmd) {
+    if (sc_should_spoof()) return 6;
+    return orig_NSProcessInfo_processorCount(self, _cmd);
+}
+
+// NWPath / NWInterface — cellular fake
+// NWPathMonitor uses these to determine WiFi vs Cellular
+static int32_t (*orig_NWPath_status)(id, SEL);
+static int32_t sc_NWPath_status(id self, SEL _cmd) {
+    if (sc_should_spoof()) return 1; // satisfied
+    return orig_NWPath_status ? orig_NWPath_status(self, _cmd) : 1;
+}
+
+static BOOL (*orig_NWPath_isExpensive)(id, SEL);
+static BOOL sc_NWPath_isExpensive(id self, SEL _cmd) {
+    if (sc_should_spoof()) {
+        if (sc_networkMode == 2) return YES; // cellular = expensive
+        if (sc_networkMode == 1) return NO;  // wifi = not expensive
+    }
+    return orig_NWPath_isExpensive ? orig_NWPath_isExpensive(self, _cmd) : NO;
+}
+
+static BOOL (*orig_NWPath_usesInterfaceType)(id, SEL, int32_t);
+static BOOL sc_NWPath_usesInterfaceType(id self, SEL _cmd, int32_t interfaceType) {
+    if (sc_should_spoof()) {
+        // NWInterfaceType: 1=WiFi, 2=Cellular, 3=Wired, 4=Loopback
+        if (sc_networkMode == 2) { // cellular mode
+            if (interfaceType == 2) return YES; // cellular
+            if (interfaceType == 1) return NO;  // wifi
+        } else if (sc_networkMode == 1) { // wifi mode
+            if (interfaceType == 1) return YES; // wifi
+            if (interfaceType == 2) return NO;  // cellular
+        }
+    }
+    return orig_NWPath_usesInterfaceType ? orig_NWPath_usesInterfaceType(self, _cmd, interfaceType) : NO;
+}
+
+static int32_t (*orig_NWInterface_type)(id, SEL);
+static int32_t sc_NWInterface_type(id self, SEL _cmd) {
+    if (sc_should_spoof()) {
+        if (sc_networkMode == 2) return 2; // Cellular
+        if (sc_networkMode == 1) return 1; // WiFi
+    }
+    return orig_NWInterface_type ? orig_NWInterface_type(self, _cmd) : 0;
+}
+
+static NSString *(*orig_NWInterface_name)(id, SEL);
+static NSString *sc_NWInterface_name(id self, SEL _cmd) {
+    if (sc_should_spoof()) {
+        if (sc_networkMode == 2) return @"pdp_ip0";
+        if (sc_networkMode == 1) return @"en0";
+    }
+    return orig_NWInterface_name ? orig_NWInterface_name(self, _cmd) : nil;
+}
+
+// SCNetworkReachability — cellular/WiFi flags
+static Boolean (*orig_SCNetworkReachabilityGetFlags)(SCNetworkReachabilityRef, SCNetworkReachabilityFlags *);
+static Boolean sc_SCNetworkReachabilityGetFlags_hook(SCNetworkReachabilityRef ref, SCNetworkReachabilityFlags *flags) {
+    Boolean r = orig_SCNetworkReachabilityGetFlags(ref, flags);
+    if (r && sc_should_spoof() && flags) {
+        if (sc_networkMode == 2) {
+            *flags |= kSCNetworkReachabilityFlagsIsWWAN;
+            *flags &= ~kSCNetworkReachabilityFlagsIsDirect;
+        } else if (sc_networkMode == 1) {
+            *flags &= ~kSCNetworkReachabilityFlagsIsWWAN;
+        }
+    }
+    return r;
+}
+
+// CNCopyCurrentNetworkInfo — WiFi SSID/BSSID spoof
+static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef);
+static CFDictionaryRef sc_CNCopyCurrentNetworkInfo_hook(CFStringRef interfaceName) {
+    CFDictionaryRef r = orig_CNCopyCurrentNetworkInfo ? orig_CNCopyCurrentNetworkInfo(interfaceName) : NULL;
+    if (!sc_should_spoof()) return r;
+    // cellular mode: return NULL (no WiFi)
+    if (sc_networkMode == 2) {
+        if (r) CFRelease(r);
+        return NULL;
+    }
+    // wifi mode: replace SSID/BSSID
+    if (sc_networkMode == 1) {
+        if (r) CFRelease(r);
+        CFStringRef ssid = CFStringCreateWithCString(kCFAllocatorDefault, sc_wifiSSID, kCFStringEncodingUTF8);
+        CFStringRef bssid = CFStringCreateWithCString(kCFAllocatorDefault, sc_wifiBSSID, kCFStringEncodingUTF8);
+        return CFDictionaryCreate(NULL,
+            (const void *[]){ CFSTR("SSID"), CFSTR("BSSID") },
+            (const void *[]){ ssid, bssid },
+            2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    }
+    return r;
+}
+
+static void sc_hook_objc_method(Class cls, SEL sel, IMP newImp, IMP *origImp) {
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    *origImp = method_setImplementation(m, newImp);
+}
+
+static void sc_hook_objc_class_method(Class cls, SEL sel, IMP newImp, IMP *origImp) {
+    Method m = class_getClassMethod(cls, sel);
+    if (!m) return;
+    *origImp = method_setImplementation(m, newImp);
+}
+
+static void sc_install_objc_hooks(void) {
+    // UIDevice
+    Class uiDevice = objc_getClass("UIDevice");
+    if (uiDevice) {
+        sc_hook_objc_method(uiDevice, @selector(model), (IMP)sc_UIDevice_model, (IMP *)&orig_UIDevice_model);
+        sc_hook_objc_method(uiDevice, @selector(localizedModel), (IMP)sc_UIDevice_localizedModel, (IMP *)&orig_UIDevice_localizedModel);
+        sc_hook_objc_method(uiDevice, @selector(systemVersion), (IMP)sc_UIDevice_systemVersion, (IMP *)&orig_UIDevice_systemVersion);
+    }
+
+    // NSProcessInfo
+    Class procInfo = objc_getClass("NSProcessInfo");
+    if (procInfo) {
+        sc_hook_objc_method(procInfo, @selector(operatingSystemVersionString), (IMP)sc_NSProcessInfo_operatingSystemVersionString, (IMP *)&orig_NSProcessInfo_operatingSystemVersionString);
+        sc_hook_objc_method(procInfo, @selector(physicalMemory), (IMP)sc_NSProcessInfo_physicalMemory, (IMP *)&orig_NSProcessInfo_physicalMemory);
+        sc_hook_objc_method(procInfo, @selector(processorCount), (IMP)sc_NSProcessInfo_processorCount, (IMP *)&orig_NSProcessInfo_processorCount);
+    }
+
+    // NWPath / NWInterface — cellular fake
+    Class nwPath = objc_getClass("NWPath");
+    if (nwPath) {
+        sc_hook_objc_method(nwPath, @selector(status), (IMP)sc_NWPath_status, (IMP *)&orig_NWPath_status);
+        sc_hook_objc_method(nwPath, @selector(isExpensive), (IMP)sc_NWPath_isExpensive, (IMP *)&orig_NWPath_isExpensive);
+        sc_hook_objc_method(nwPath, @selector(usesInterfaceType:), (IMP)sc_NWPath_usesInterfaceType, (IMP *)&orig_NWPath_usesInterfaceType);
+    }
+    Class nwInterface = objc_getClass("NWInterface");
+    if (nwInterface) {
+        sc_hook_objc_method(nwInterface, @selector(type), (IMP)sc_NWInterface_type, (IMP *)&orig_NWInterface_type);
+        sc_hook_objc_method(nwInterface, @selector(name), (IMP)sc_NWInterface_name, (IMP *)&orig_NWInterface_name);
+    }
+}
+
+// ============================================================================
 // Init — called from systemhook main.c
 // ============================================================================
 
@@ -384,15 +680,12 @@ void iosspoof_system_init(void) {
     sc_load_config();
     if (!sc_enabled) return;
 
-    // Use litehook — instruction patching, no substrate needed
-    // These hooks are invisible to app (no MSHookFunction pattern)
+    // Set env var so iOSSpoof tweak knows systemhook is active
+    setenv("SC_SYSTEMHOOK_ACTIVE", "1", 1);
 
-    // sysctl — device identity spoof
+    // C function hooks via litehook (invisible to banking apps)
     litehook_hook_function(sysctlbyname, sc_sysctlbyname_hook);
-    // Note: __sysctlbyname is already hooked by roothide for path remap
-    // We hook the public sysctlbyname which calls __sysctlbyname internally
 
-    // File access — hide jailbreak
     if (sc_hideJailbreak) {
         litehook_hook_function(access, sc_access_hook);
         litehook_hook_function(stat, sc_stat_hook);
@@ -401,10 +694,39 @@ void iosspoof_system_init(void) {
         litehook_hook_function(fork, sc_fork_hook);
         litehook_hook_function(_dyld_image_count, sc_dyld_image_count_hook);
         litehook_hook_function(_dyld_get_image_name, sc_dyld_get_image_name_hook);
+        litehook_hook_function(readlink, sc_readlink_hook);
+        litehook_hook_function(realpath, sc_realpath_hook);
 
-        // csops — already hooked by roothide on arm64, but we add our own layer
 #ifndef __arm64e__
         litehook_hook_function(csops, sc_csops_hook);
 #endif
+        litehook_hook_function(task_for_pid, sc_task_for_pid_hook);
     }
+
+    // Storage spoof
+    litehook_hook_function(statfs, sc_statfs_hook);
+    litehook_hook_function(statvfs, sc_statvfs_hook);
+
+    // Device identity
+    litehook_hook_function(uname, sc_uname_hook);
+
+    // Timestamp spoof
+    if (sc_timestamp_offset != 0) {
+        litehook_hook_function(time, sc_time_hook);
+        litehook_hook_function(gettimeofday, sc_gettimeofday_hook);
+    }
+
+    // Network hooks — SCNetworkReachability + CaptiveNetwork
+    void *scFramework = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_NOW);
+    if (scFramework) {
+        void *scReach = dlsym(scFramework, "SCNetworkReachabilityGetFlags");
+        if (scReach) litehook_hook_function(scReach, sc_SCNetworkReachabilityGetFlags_hook, (void **)&orig_SCNetworkReachabilityGetFlags);
+
+        void *cnInfo = dlsym(scFramework, "CNCopyCurrentNetworkInfo");
+        if (cnInfo) litehook_hook_function(cnInfo, sc_CNCopyCurrentNetworkInfo_hook, (void **)&orig_CNCopyCurrentNetworkInfo);
+    }
+
+    // ObjC hooks — use method_setImplementation (NOT MSHookFunction)
+    // This is invisible to banking apps — no instruction pattern to detect
+    sc_install_objc_hooks();
 }
