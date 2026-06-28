@@ -40,7 +40,10 @@ __attribute__((used, visibility("default")))
 const char *iosspoof_systemhook_build_marker = "SC_SYSTEMHOOK_ACTIVE:iOSSpoof-systemhook";
 
 static bool sc_enabled = false;
+static bool sc_kernelMode = false;
 static bool sc_hideJailbreak = true;
+static bool sc_prefsFound = false;
+static CFArrayRef sc_targetBundles = NULL;
 static char sc_productType[64] = "iPhone14,5";
 static char sc_hardwareModel[64] = "D63AP";
 static char sc_marketingName[64] = "iPhone 13";
@@ -53,6 +56,14 @@ static char sc_carrierMCC[8] = "452";
 static char sc_carrierMNC[8] = "04";
 static char sc_carrierISO[8] = "vn";
 static char sc_radioTech[64] = "CTRadioAccessTechnologyLTE";
+static char sc_simName[2][64] = {"Viettel", "Mobifone"};
+static char sc_simMCC[2][8] = {"452", "452"};
+static char sc_simMNC[2][8] = {"04", "01"};
+static char sc_simISO[2][8] = {"vn", "vn"};
+static char sc_simRadio[2][64] = {"CTRadioAccessTechnologyLTE", "CTRadioAccessTechnologyLTE"};
+static char sc_simPhone[2][32] = {"", ""};
+static bool sc_simEnabled[2] = {true, false};
+static bool sc_simESIM[2] = {false, true};
 static int sc_networkMode = 0; // 0=default, 1=wifi, 2=cellular
 static char sc_wifiSSID[128] = "MyWiFi";
 static char sc_wifiBSSID[32] = "02:00:00:00:00:00";
@@ -62,6 +73,7 @@ static char sc_cellularRouter[32] = "10.23.42.1";
 static char sc_locale[32] = "";
 static char sc_timezone[64] = "";
 static bool sc_configLoaded = false;
+static bool sc_hooksInstalled = false;
 
 static bool sc_is_wifi_ifname(const char *name) {
     return name && (!strcmp(name, "en0") || !strncmp(name, "awdl", 4) || !strncmp(name, "llw", 3));
@@ -94,6 +106,20 @@ typedef const void * nw_path_t;
 typedef const void * nw_interface_t;
 typedef int32_t nw_path_status_t;
 typedef int32_t nw_interface_type_t;
+
+static bool sc_rebind_exception_filter(const mach_header_u *header) {
+    if (!header) return true;
+    Dl_info info = {};
+    if (dladdr((const void *)header, &info) && info.dli_fname) {
+        if (strstr(info.dli_fname, "systemhook.dylib")) return false;
+    }
+    return true;
+}
+
+static void sc_rebind_symbol(void *replacee, void *replacement) {
+    if (!replacee || !replacement) return;
+    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, replacee, replacement, sc_rebind_exception_filter);
+}
 
 static void sc_load_config(void) {
     if (sc_configLoaded) return;
@@ -129,10 +155,15 @@ static void sc_load_config(void) {
         return;
     }
 
+    sc_prefsFound = true;
+
     CFDictionaryRef d = (CFDictionaryRef)plist;
 
     CFBooleanRef en = CFDictionaryGetValue(d, CFSTR("enabled"));
     if (en) sc_enabled = CFBooleanGetValue(en);
+
+    CFBooleanRef km = CFDictionaryGetValue(d, CFSTR("kernelMode"));
+    if (km) sc_kernelMode = CFBooleanGetValue(km);
 
     CFBooleanRef hj = CFDictionaryGetValue(d, CFSTR("hideJailbreak"));
     if (hj) sc_hideJailbreak = CFBooleanGetValue(hj);
@@ -167,6 +198,25 @@ static void sc_load_config(void) {
     CFStringRef rt = CFDictionaryGetValue(d, CFSTR("radioTech"));
     if (rt) CFStringGetCString(rt, sc_radioTech, sizeof(sc_radioTech), kCFStringEncodingUTF8);
 
+    CFArrayRef sims = CFDictionaryGetValue(d, CFSTR("simSlots"));
+    if (sims && CFGetTypeID(sims) == CFArrayGetTypeID()) {
+        for (CFIndex i = 0; i < CFArrayGetCount(sims) && i < 2; i++) {
+            CFDictionaryRef sim = CFArrayGetValueAtIndex(sims, i);
+            if (!sim || CFGetTypeID(sim) != CFDictionaryGetTypeID()) continue;
+            CFBooleanRef en = CFDictionaryGetValue(sim, CFSTR("enabled"));
+            if (en) sc_simEnabled[i] = CFBooleanGetValue(en);
+            CFBooleanRef es = CFDictionaryGetValue(sim, CFSTR("eSIM"));
+            if (es) sc_simESIM[i] = CFBooleanGetValue(es);
+            CFStringRef v;
+            v = CFDictionaryGetValue(sim, CFSTR("carrierName")); if (v) CFStringGetCString(v, sc_simName[i], sizeof(sc_simName[i]), kCFStringEncodingUTF8);
+            v = CFDictionaryGetValue(sim, CFSTR("carrierMCC")); if (v) CFStringGetCString(v, sc_simMCC[i], sizeof(sc_simMCC[i]), kCFStringEncodingUTF8);
+            v = CFDictionaryGetValue(sim, CFSTR("carrierMNC")); if (v) CFStringGetCString(v, sc_simMNC[i], sizeof(sc_simMNC[i]), kCFStringEncodingUTF8);
+            v = CFDictionaryGetValue(sim, CFSTR("carrierISO")); if (v) CFStringGetCString(v, sc_simISO[i], sizeof(sc_simISO[i]), kCFStringEncodingUTF8);
+            v = CFDictionaryGetValue(sim, CFSTR("radioTech")); if (v) CFStringGetCString(v, sc_simRadio[i], sizeof(sc_simRadio[i]), kCFStringEncodingUTF8);
+            v = CFDictionaryGetValue(sim, CFSTR("phoneNumber")); if (v) CFStringGetCString(v, sc_simPhone[i], sizeof(sc_simPhone[i]), kCFStringEncodingUTF8);
+        }
+    }
+
     CFNumberRef nm = CFDictionaryGetValue(d, CFSTR("networkMode"));
     if (nm) CFNumberGetValue(nm, kCFNumberIntType, &sc_networkMode);
 
@@ -194,38 +244,87 @@ static void sc_load_config(void) {
     // Read target bundles — if empty and enabled, spoof for ALL apps
     CFArrayRef tb = CFDictionaryGetValue(d, CFSTR("targetBundles"));
     if (tb && CFArrayGetCount(tb) > 0) {
-        // Check if current bundle is in target list
-        // We'll check in the hook functions
+        if (sc_targetBundles) CFRelease(sc_targetBundles);
+        sc_targetBundles = CFRetain(tb);
     }
 
     CFRelease(plist);
 }
 
-// Check if current process should be spoofed
-static bool sc_should_spoof(void) {
-    if (!sc_enabled) return false;
+static bool sc_copy_current_bundle_id(char *out, size_t outSize) {
+    if (!out || outSize == 0) return false;
+    out[0] = '\0';
 
-    // Protected bundles — never spoof
-    const char *bid = getenv("SC_BUNDLE_ID");
-    if (!bid) {
-        // Try to get bundle ID from executable path
-        static char execPath[PATH_MAX];
-        uint32_t size = PATH_MAX;
-        if (_NSGetExecutablePath(execPath, &size) == 0) {
-            // Check if this is a protected system process
-            if (strstr(execPath, "SpringBoard") || strstr(execPath, "Preferences") ||
-                strstr(execPath, "cfprefsd") || strstr(execPath, "lsd") ||
-                strstr(execPath, "installd") || strstr(execPath, "debugserver")) {
-                return false;
-            }
-        }
-        return true; // No bundle ID check — spoof all
+    CFBundleRef bundle = CFBundleGetMainBundle();
+    if (!bundle) return false;
+    CFStringRef bid = CFBundleGetIdentifier(bundle);
+    if (!bid) return false;
+    return CFStringGetCString(bid, out, outSize, kCFStringEncodingUTF8);
+}
+
+static bool sc_is_protected_bundle_id(const char *bid) {
+    if (!bid || !bid[0]) return true;
+    static const char *protected[] = {
+        "com.iosspoof.app",
+        "com.apple.springboard",
+        "com.apple.Preferences",
+        "com.apple.mobilesafari",
+        "com.apple.MobileSMS",
+        "com.apple.mobilephone",
+        "com.apple.mobilemail",
+        "com.apple.AppStore",
+        "com.apple.appstore",
+        "org.coolstar.SileoStore",
+        "org.coolstar.Sileo",
+        "com.saurik.Cydia",
+        "xyz.willy.Zebra",
+        "me.apptapp.Installer",
+        "com.opa334.Dopamine",
+        "com.opa334.Dopamine-roothide",
+        "com.opa334.TrollStore",
+        "com.opa334.TrollStorePersistenceHelper",
+        NULL
+    };
+    for (int i = 0; protected[i]; i++) {
+        if (!strcmp(bid, protected[i])) return true;
+    }
+    return false;
+}
+
+static bool sc_is_critical_executable(void) {
+    static char execPath[PATH_MAX];
+    uint32_t size = PATH_MAX;
+    if (_NSGetExecutablePath(execPath, &size) != 0) return true;
+    return strstr(execPath, "SpringBoard") || strstr(execPath, "Preferences") ||
+           strstr(execPath, "cfprefsd") || strstr(execPath, "lsd") ||
+           strstr(execPath, "installd") || strstr(execPath, "backboardd") ||
+           strstr(execPath, "runningboardd") || strstr(execPath, "securityd") ||
+           strstr(execPath, "debugserver") || strstr(execPath, "xpcproxy");
+}
+
+static bool sc_bundle_is_targeted(const char *bid) {
+    if (!sc_targetBundles || CFArrayGetCount(sc_targetBundles) == 0) {
+        // Kernel-level systemhook must never default to global mode. The app must
+        // explicitly select target bundles before systemhook installs hooks.
+        return false;
     }
 
-    if (strcmp(bid, "com.apple.springboard") == 0) return false;
-    if (strcmp(bid, "com.apple.Preferences") == 0) return false;
-    if (strcmp(bid, "com.iosspoof.app") == 0) return false;
+    CFStringRef bidString = CFStringCreateWithCString(kCFAllocatorDefault, bid, kCFStringEncodingUTF8);
+    if (!bidString) return false;
+    bool found = CFArrayContainsValue(sc_targetBundles, CFRangeMake(0, CFArrayGetCount(sc_targetBundles)), bidString);
+    CFRelease(bidString);
+    return found;
+}
 
+// Check if current process should be spoofed
+static bool sc_should_spoof(void) {
+    if (!sc_prefsFound || !sc_enabled || !sc_kernelMode) return false;
+    if (sc_is_critical_executable()) return false;
+
+    char bid[256];
+    if (!sc_copy_current_bundle_id(bid, sizeof(bid))) return false;
+    if (sc_is_protected_bundle_id(bid)) return false;
+    if (!sc_bundle_is_targeted(bid)) return false;
     return true;
 }
 
@@ -815,6 +914,80 @@ static CFArrayRef sc_SCDynamicStoreCopyKeyList_hook(SCDynamicStoreRef store, CFS
     return CFArrayCreate(NULL, NULL, 0, NULL);
 }
 
+// MobileGestalt — Settings/About and many private capability lookups
+static CFTypeRef (*orig_MGCopyAnswer)(CFStringRef);
+static CFDictionaryRef (*orig_MGCopyMultipleAnswers)(CFArrayRef, CFDictionaryRef);
+
+static CFTypeRef sc_copy_mg_answer(CFStringRef key) {
+    if (!sc_should_spoof() || !key) return NULL;
+    NSString *k = (__bridge NSString *)key;
+    NSString *productType = [NSString stringWithUTF8String:sc_productType];
+    NSString *marketingName = [NSString stringWithUTF8String:sc_marketingName];
+    NSString *hardwareModel = [NSString stringWithUTF8String:sc_hardwareModel];
+    NSString *buildID = [NSString stringWithUTF8String:sc_buildID];
+    NSString *systemVersion = [NSString stringWithUTF8String:sc_systemVersion];
+    NSString *serial = [NSString stringWithUTF8String:sc_serial];
+    NSString *udid = [NSString stringWithUTF8String:sc_udid];
+    NSString *carrierISO = [NSString stringWithUTF8String:sc_carrierISO];
+    NSString *bluetooth = sc_cellularIPv4[0] ? [NSString stringWithUTF8String:sc_wifiBSSID] : @"";
+
+    NSDictionary *answers = @{
+        @"ProductType": productType,
+        @"ProductName": marketingName,
+        @"MarketingName": marketingName,
+        @"HWModelStr": hardwareModel,
+        @"HardwareModel": hardwareModel,
+        @"DeviceClass": @"iPhone",
+        @"DeviceVariant": @"A",
+        @"BuildVersion": buildID,
+        @"ProductVersion": systemVersion,
+        @"SerialNumber": serial ?: @"",
+        @"UniqueDeviceID": udid ?: @"",
+        @"RegionCode": carrierISO.uppercaseString ?: @"US",
+        @"RegionInfo": carrierISO.uppercaseString ?: @"US",
+        @"WifiAddress": [NSString stringWithUTF8String:sc_wifiBSSID],
+        @"BluetoothAddress": bluetooth,
+    };
+    id v = answers[k];
+    return v ? CFRetain((__bridge CFTypeRef)v) : NULL;
+}
+
+static CFTypeRef sc_MGCopyAnswer_hook(CFStringRef key) {
+    CFTypeRef fake = sc_copy_mg_answer(key);
+    if (fake) return fake;
+    return orig_MGCopyAnswer ? orig_MGCopyAnswer(key) : NULL;
+}
+
+static CFDictionaryRef sc_MGCopyMultipleAnswers_hook(CFArrayRef keys, CFDictionaryRef options) {
+    CFDictionaryRef orig = orig_MGCopyMultipleAnswers ? orig_MGCopyMultipleAnswers(keys, options) : NULL;
+    NSMutableDictionary *m = orig ? [(__bridge NSDictionary *)orig mutableCopy] : [NSMutableDictionary dictionary];
+    if (orig) CFRelease(orig);
+    if (keys) {
+        for (id keyObj in (__bridge NSArray *)keys) {
+            if (![keyObj isKindOfClass:NSString.class]) continue;
+            CFTypeRef fake = sc_copy_mg_answer((__bridge CFStringRef)keyObj);
+            if (fake) m[keyObj] = CFBridgingRelease(fake);
+        }
+    }
+    return CFBridgingRetain(m);
+}
+
+static void sc_install_mobilegestalt_hooks(void) {
+    void *mg = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_NOW);
+    if (!mg) mg = dlopen("/System/Library/PrivateFrameworks/MobileGestalt.framework/MobileGestalt", RTLD_NOW);
+    if (!mg) return;
+    void *copyAnswer = dlsym(mg, "MGCopyAnswer");
+    if (copyAnswer) {
+        orig_MGCopyAnswer = (CFTypeRef (*)(CFStringRef))copyAnswer;
+        sc_rebind_symbol(copyAnswer, (void *)sc_MGCopyAnswer_hook);
+    }
+    void *copyMultiple = dlsym(mg, "MGCopyMultipleAnswers");
+    if (copyMultiple) {
+        orig_MGCopyMultipleAnswers = (CFDictionaryRef (*)(CFArrayRef, CFDictionaryRef))copyMultiple;
+        sc_rebind_symbol(copyMultiple, (void *)sc_MGCopyMultipleAnswers_hook);
+    }
+}
+
 static void sc_hook_objc_method(Class cls, SEL sel, IMP newImp, IMP *origImp) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return;
@@ -825,6 +998,144 @@ static void sc_hook_objc_class_method(Class cls, SEL sel, IMP newImp, IMP *origI
     Method m = class_getClassMethod(cls, sel);
     if (!m) return;
     *origImp = method_setImplementation(m, newImp);
+}
+
+static const void *scCarrierSlotKey = &scCarrierSlotKey;
+
+static NSInteger sc_carrier_slot(id self) {
+    NSNumber *n = objc_getAssociatedObject(self, scCarrierSlotKey);
+    NSInteger slot = n ? n.integerValue : 0;
+    if (slot < 0 || slot > 1) slot = 0;
+    return slot;
+}
+
+static NSString *(*orig_CTCarrier_carrierName)(id, SEL);
+static NSString *sc_CTCarrier_carrierName(id self, SEL _cmd) {
+    if (sc_should_spoof()) return [NSString stringWithUTF8String:sc_simName[sc_carrier_slot(self)]];
+    return orig_CTCarrier_carrierName ? orig_CTCarrier_carrierName(self, _cmd) : nil;
+}
+static NSString *(*orig_CTCarrier_mobileCountryCode)(id, SEL);
+static NSString *sc_CTCarrier_mobileCountryCode(id self, SEL _cmd) {
+    if (sc_should_spoof()) return [NSString stringWithUTF8String:sc_simMCC[sc_carrier_slot(self)]];
+    return orig_CTCarrier_mobileCountryCode ? orig_CTCarrier_mobileCountryCode(self, _cmd) : nil;
+}
+static NSString *(*orig_CTCarrier_mobileNetworkCode)(id, SEL);
+static NSString *sc_CTCarrier_mobileNetworkCode(id self, SEL _cmd) {
+    if (sc_should_spoof()) return [NSString stringWithUTF8String:sc_simMNC[sc_carrier_slot(self)]];
+    return orig_CTCarrier_mobileNetworkCode ? orig_CTCarrier_mobileNetworkCode(self, _cmd) : nil;
+}
+static NSString *(*orig_CTCarrier_isoCountryCode)(id, SEL);
+static NSString *sc_CTCarrier_isoCountryCode(id self, SEL _cmd) {
+    if (sc_should_spoof()) return [[NSString stringWithUTF8String:sc_simISO[sc_carrier_slot(self)]] uppercaseString];
+    return orig_CTCarrier_isoCountryCode ? orig_CTCarrier_isoCountryCode(self, _cmd) : nil;
+}
+
+static id (*orig_CTTelephony_subscriberCellularProvider)(id, SEL);
+static id sc_CTTelephony_subscriberCellularProvider(id self, SEL _cmd) {
+    if (sc_should_spoof()) {
+        Class carrier = objc_getClass("CTCarrier");
+        id c = carrier ? [carrier new] : nil;
+        if (c) objc_setAssociatedObject(c, scCarrierSlotKey, @0, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return c;
+    }
+    return orig_CTTelephony_subscriberCellularProvider ? orig_CTTelephony_subscriberCellularProvider(self, _cmd) : nil;
+}
+static NSDictionary *(*orig_CTTelephony_serviceSubscriberCellularProviders)(id, SEL);
+static NSDictionary *sc_CTTelephony_serviceSubscriberCellularProviders(id self, SEL _cmd) {
+    if (sc_should_spoof()) {
+        Class carrier = objc_getClass("CTCarrier");
+        NSMutableDictionary *m = [NSMutableDictionary dictionary];
+        for (NSInteger i = 0; i < 2; i++) {
+            if (!sc_simEnabled[i]) continue;
+            id c = carrier ? [carrier new] : nil;
+            if (!c) continue;
+            objc_setAssociatedObject(c, scCarrierSlotKey, @(i), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            m[[NSString stringWithFormat:@"kCTCarrierSlot%ld", (long)i + 1]] = c;
+        }
+        return m;
+    }
+    return orig_CTTelephony_serviceSubscriberCellularProviders ? orig_CTTelephony_serviceSubscriberCellularProviders(self, _cmd) : nil;
+}
+static NSString *(*orig_CTTelephony_currentRadioAccessTechnology)(id, SEL);
+static NSString *sc_CTTelephony_currentRadioAccessTechnology(id self, SEL _cmd) {
+    if (sc_should_spoof()) return [NSString stringWithUTF8String:sc_simRadio[0]];
+    return orig_CTTelephony_currentRadioAccessTechnology ? orig_CTTelephony_currentRadioAccessTechnology(self, _cmd) : nil;
+}
+static NSDictionary *(*orig_CTTelephony_serviceCurrentRadioAccessTechnology)(id, SEL);
+static NSDictionary *sc_CTTelephony_serviceCurrentRadioAccessTechnology(id self, SEL _cmd) {
+    if (sc_should_spoof()) {
+        NSMutableDictionary *m = [NSMutableDictionary dictionary];
+        for (NSInteger i = 0; i < 2; i++) if (sc_simEnabled[i]) m[[NSString stringWithFormat:@"kCTRadioAccessTechnologySlot%ld", (long)i + 1]] = [NSString stringWithUTF8String:sc_simRadio[i]];
+        return m;
+    }
+    return orig_CTTelephony_serviceCurrentRadioAccessTechnology ? orig_CTTelephony_serviceCurrentRadioAccessTechnology(self, _cmd) : nil;
+}
+
+static void sc_install_coretelephony_hooks(void) {
+    Class carrier = objc_getClass("CTCarrier");
+    if (carrier) {
+        sc_hook_objc_method(carrier, @selector(carrierName), (IMP)sc_CTCarrier_carrierName, (IMP *)&orig_CTCarrier_carrierName);
+        sc_hook_objc_method(carrier, @selector(mobileCountryCode), (IMP)sc_CTCarrier_mobileCountryCode, (IMP *)&orig_CTCarrier_mobileCountryCode);
+        sc_hook_objc_method(carrier, @selector(mobileNetworkCode), (IMP)sc_CTCarrier_mobileNetworkCode, (IMP *)&orig_CTCarrier_mobileNetworkCode);
+        sc_hook_objc_method(carrier, @selector(isoCountryCode), (IMP)sc_CTCarrier_isoCountryCode, (IMP *)&orig_CTCarrier_isoCountryCode);
+    }
+    Class telephony = objc_getClass("CTTelephonyNetworkInfo");
+    if (telephony) {
+        sc_hook_objc_method(telephony, @selector(subscriberCellularProvider), (IMP)sc_CTTelephony_subscriberCellularProvider, (IMP *)&orig_CTTelephony_subscriberCellularProvider);
+        sc_hook_objc_method(telephony, @selector(serviceSubscriberCellularProviders), (IMP)sc_CTTelephony_serviceSubscriberCellularProviders, (IMP *)&orig_CTTelephony_serviceSubscriberCellularProviders);
+        sc_hook_objc_method(telephony, @selector(currentRadioAccessTechnology), (IMP)sc_CTTelephony_currentRadioAccessTechnology, (IMP *)&orig_CTTelephony_currentRadioAccessTechnology);
+        sc_hook_objc_method(telephony, @selector(serviceCurrentRadioAccessTechnology), (IMP)sc_CTTelephony_serviceCurrentRadioAccessTechnology, (IMP *)&orig_CTTelephony_serviceCurrentRadioAccessTechnology);
+    }
+}
+
+static void sc_install_c_rebind_hooks(void) {
+    orig_sysctlbyname = sysctlbyname;
+    sc_rebind_symbol((void *)sysctlbyname, (void *)sc_sysctlbyname_hook);
+
+    orig_access_sc = access;
+    orig_stat_sc = stat;
+    orig_lstat_sc = lstat;
+    orig_getenv_sc = getenv;
+    orig_fork_sc = fork;
+    orig_dyld_image_count_sc = _dyld_image_count;
+    orig_dyld_get_image_name_sc = _dyld_get_image_name;
+    orig_statfs_sc = statfs;
+    orig_statvfs_sc = statvfs;
+    orig_uname_sc = uname;
+    orig_readlink_sc = readlink;
+    orig_realpath_sc = realpath;
+    orig_time_sc = time;
+    orig_gettimeofday_sc = gettimeofday;
+    orig_getifaddrs = getifaddrs;
+    orig_if_nametoindex = if_nametoindex;
+    orig_if_indextoname = if_indextoname;
+
+    if (sc_hideJailbreak) {
+        sc_rebind_symbol((void *)access, (void *)sc_access_hook);
+        sc_rebind_symbol((void *)stat, (void *)sc_stat_hook);
+        sc_rebind_symbol((void *)lstat, (void *)sc_lstat_hook);
+        sc_rebind_symbol((void *)getenv, (void *)sc_getenv_hook);
+        sc_rebind_symbol((void *)fork, (void *)sc_fork_hook);
+        sc_rebind_symbol((void *)_dyld_image_count, (void *)sc_dyld_image_count_hook);
+        sc_rebind_symbol((void *)_dyld_get_image_name, (void *)sc_dyld_get_image_name_hook);
+        sc_rebind_symbol((void *)readlink, (void *)sc_readlink_hook);
+        sc_rebind_symbol((void *)realpath, (void *)sc_realpath_hook);
+#ifndef __arm64e__
+        orig_csops_sc = csops;
+        sc_rebind_symbol((void *)csops, (void *)sc_csops_hook);
+#endif
+    }
+
+    sc_rebind_symbol((void *)statfs, (void *)sc_statfs_hook);
+    sc_rebind_symbol((void *)statvfs, (void *)sc_statvfs_hook);
+    sc_rebind_symbol((void *)uname, (void *)sc_uname_hook);
+    sc_rebind_symbol((void *)getifaddrs, (void *)sc_getifaddrs_hook);
+    sc_rebind_symbol((void *)if_nametoindex, (void *)sc_if_nametoindex_hook);
+    sc_rebind_symbol((void *)if_indextoname, (void *)sc_if_indextoname_hook);
+    if (sc_timestamp_offset != 0) {
+        sc_rebind_symbol((void *)time, (void *)sc_time_hook);
+        sc_rebind_symbol((void *)gettimeofday, (void *)sc_gettimeofday_hook);
+    }
 }
 
 static void sc_install_objc_hooks(void) {
@@ -874,46 +1185,15 @@ void iosspoof_system_init(void) {
     }
 
     sc_load_config();
-    if (!sc_enabled) return;
+    if (!sc_should_spoof()) return;
+    if (sc_hooksInstalled) return;
+    sc_hooksInstalled = true;
 
-    // C function hooks via litehook (invisible to banking apps)
-    litehook_hook_function(sysctlbyname, sc_sysctlbyname_hook);
+    // Use global symbol rebinding for C hooks so original function pointers stay
+    // callable. Avoid instruction patching for hooks that need orig_*.
+    sc_install_c_rebind_hooks();
+    sc_install_mobilegestalt_hooks();
 
-    if (sc_hideJailbreak) {
-        litehook_hook_function(access, sc_access_hook);
-        litehook_hook_function(stat, sc_stat_hook);
-        litehook_hook_function(lstat, sc_lstat_hook);
-        litehook_hook_function(getenv, sc_getenv_hook);
-        litehook_hook_function(fork, sc_fork_hook);
-        litehook_hook_function(_dyld_image_count, sc_dyld_image_count_hook);
-        litehook_hook_function(_dyld_get_image_name, sc_dyld_get_image_name_hook);
-        litehook_hook_function(readlink, sc_readlink_hook);
-        litehook_hook_function(realpath, sc_realpath_hook);
-
-#ifndef __arm64e__
-        litehook_hook_function(csops, sc_csops_hook);
-#endif
-        litehook_hook_function(task_for_pid, sc_task_for_pid_hook);
-    }
-
-    // Storage spoof
-    litehook_hook_function(statfs, sc_statfs_hook);
-    litehook_hook_function(statvfs, sc_statvfs_hook);
-
-    // Device identity
-    litehook_hook_function(uname, sc_uname_hook);
-
-    // Interface/IP rewrite via getifaddrs needs an original trampoline.
-    // litehook only exposes a 2-argument API, so keep this in user-space mode
-    // until a safe trampoline wrapper is added for systemhook.
-
-    // Timestamp spoof
-    if (sc_timestamp_offset != 0) {
-        litehook_hook_function(time, sc_time_hook);
-        litehook_hook_function(gettimeofday, sc_gettimeofday_hook);
-    }
-
-    // Network hooks — SCNetworkReachability + CaptiveNetwork
     void *scFramework = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_NOW);
     if (scFramework) {
         void *scReach = dlsym(scFramework, "SCNetworkReachabilityGetFlags");
@@ -947,4 +1227,5 @@ void iosspoof_system_init(void) {
     // ObjC hooks — use method_setImplementation (NOT MSHookFunction)
     // This is invisible to banking apps — no instruction pattern to detect
     sc_install_objc_hooks();
+    sc_install_coretelephony_hooks();
 }
