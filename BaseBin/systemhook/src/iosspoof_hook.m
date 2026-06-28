@@ -17,8 +17,11 @@
 #include <errno.h>
 #include <spawn.h>
 #include <dlfcn.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
+#include <net/if.h>
 #include <time.h>
 #include <objc/runtime.h>
 #include <objc/message.h>
@@ -50,9 +53,44 @@ static char sc_radioTech[64] = "CTRadioAccessTechnologyLTE";
 static int sc_networkMode = 0; // 0=default, 1=wifi, 2=cellular
 static char sc_wifiSSID[128] = "MyWiFi";
 static char sc_wifiBSSID[32] = "02:00:00:00:00:00";
+static char sc_cellularServiceID[64] = "00000000-0000-0000-0000-000000000000";
+static char sc_cellularIPv4[32] = "10.23.42.10";
+static char sc_cellularRouter[32] = "10.23.42.1";
 static char sc_locale[32] = "";
 static char sc_timezone[64] = "";
 static bool sc_configLoaded = false;
+
+static bool sc_is_wifi_ifname(const char *name) {
+    return name && (!strcmp(name, "en0") || !strncmp(name, "awdl", 4) || !strncmp(name, "llw", 3));
+}
+
+static bool sc_is_cell_ifname(const char *name) {
+    return name && (!strncmp(name, "pdp_ip", 6) || !strncmp(name, "ipsec", 5));
+}
+
+static NSDictionary *sc_cellular_ipv4_dictionary(void) {
+    return @{
+        @"PrimaryInterface": @"pdp_ip0",
+        @"PrimaryService": [NSString stringWithUTF8String:sc_cellularServiceID],
+        @"InterfaceName": @"pdp_ip0",
+        @"Addresses": @[ [NSString stringWithUTF8String:sc_cellularIPv4] ],
+        @"SubnetMasks": @[ @"255.255.255.255" ],
+        @"Router": [NSString stringWithUTF8String:sc_cellularRouter],
+        @"ConfigMethod": @"DHCP",
+        @"ConfirmedInterfaceName": @"pdp_ip0"
+    };
+}
+
+static void sc_set_sockaddr_ipv4(struct sockaddr *addr, const char *ip) {
+    if (!addr || addr->sa_family != AF_INET || !ip) return;
+    struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+    inet_pton(AF_INET, ip, &sin->sin_addr);
+}
+
+typedef const void * nw_path_t;
+typedef const void * nw_interface_t;
+typedef int32_t nw_path_status_t;
+typedef int32_t nw_interface_type_t;
 
 static void sc_load_config(void) {
     if (sc_configLoaded) return;
@@ -134,6 +172,15 @@ static void sc_load_config(void) {
 
     CFStringRef bssid = CFDictionaryGetValue(d, CFSTR("wifiBSSID"));
     if (bssid) CFStringGetCString(bssid, sc_wifiBSSID, sizeof(sc_wifiBSSID), kCFStringEncodingUTF8);
+
+    CFStringRef csid = CFDictionaryGetValue(d, CFSTR("cellularServiceID"));
+    if (csid) CFStringGetCString(csid, sc_cellularServiceID, sizeof(sc_cellularServiceID), kCFStringEncodingUTF8);
+
+    CFStringRef cip = CFDictionaryGetValue(d, CFSTR("cellularIPv4"));
+    if (cip) CFStringGetCString(cip, sc_cellularIPv4, sizeof(sc_cellularIPv4), kCFStringEncodingUTF8);
+
+    CFStringRef cr = CFDictionaryGetValue(d, CFSTR("cellularRouter"));
+    if (cr) CFStringGetCString(cr, sc_cellularRouter, sizeof(sc_cellularRouter), kCFStringEncodingUTF8);
 
     CFStringRef loc = CFDictionaryGetValue(d, CFSTR("localeIdentifier"));
     if (loc) CFStringGetCString(loc, sc_locale, sizeof(sc_locale), kCFStringEncodingUTF8);
@@ -593,31 +640,29 @@ static NSString *sc_NWInterface_name(id self, SEL _cmd) {
 // SCNetworkReachability — cellular/WiFi flags
 static Boolean (*orig_SCNetworkReachabilityGetFlags)(SCNetworkReachabilityRef, SCNetworkReachabilityFlags *);
 static Boolean sc_SCNetworkReachabilityGetFlags_hook(SCNetworkReachabilityRef ref, SCNetworkReachabilityFlags *flags) {
-    Boolean r = orig_SCNetworkReachabilityGetFlags(ref, flags);
-    if (r && sc_should_spoof() && flags) {
+    if (sc_should_spoof() && flags) {
+        *flags = kSCNetworkReachabilityFlagsReachable;
         if (sc_networkMode == 2) {
             *flags |= kSCNetworkReachabilityFlagsIsWWAN;
             *flags &= ~kSCNetworkReachabilityFlagsIsDirect;
         } else if (sc_networkMode == 1) {
             *flags &= ~kSCNetworkReachabilityFlagsIsWWAN;
         }
+        return true;
     }
-    return r;
+    return false;
 }
 
 // CNCopyCurrentNetworkInfo — WiFi SSID/BSSID spoof
 static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef);
 static CFDictionaryRef sc_CNCopyCurrentNetworkInfo_hook(CFStringRef interfaceName) {
-    CFDictionaryRef r = orig_CNCopyCurrentNetworkInfo ? orig_CNCopyCurrentNetworkInfo(interfaceName) : NULL;
-    if (!sc_should_spoof()) return r;
+    if (!sc_should_spoof()) return NULL;
     // cellular mode: return NULL (no WiFi)
     if (sc_networkMode == 2) {
-        if (r) CFRelease(r);
         return NULL;
     }
     // wifi mode: replace SSID/BSSID
     if (sc_networkMode == 1) {
-        if (r) CFRelease(r);
         CFStringRef ssid = CFStringCreateWithCString(kCFAllocatorDefault, sc_wifiSSID, kCFStringEncodingUTF8);
         CFStringRef bssid = CFStringCreateWithCString(kCFAllocatorDefault, sc_wifiBSSID, kCFStringEncodingUTF8);
         return CFDictionaryCreate(NULL,
@@ -625,7 +670,146 @@ static CFDictionaryRef sc_CNCopyCurrentNetworkInfo_hook(CFStringRef interfaceNam
             (const void *[]){ ssid, bssid },
             2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     }
+    return NULL;
+}
+
+// getifaddrs / if_nametoindex / if_indextoname — hide WiFi/private IPv4 when fake cellular
+static int (*orig_getifaddrs)(struct ifaddrs **);
+static int sc_getifaddrs_hook(struct ifaddrs **ifap) {
+    int r = orig_getifaddrs ? orig_getifaddrs(ifap) : -1;
+    if (r != 0 || !ifap || !*ifap || !sc_should_spoof()) return r;
+
+    struct ifaddrs *cur = *ifap;
+    while (cur) {
+        if (sc_networkMode == 2 && sc_is_wifi_ifname(cur->ifa_name)) {
+            strlcpy(cur->ifa_name, "pdp_ip0", IFNAMSIZ);
+            sc_set_sockaddr_ipv4(cur->ifa_addr, sc_cellularIPv4);
+            sc_set_sockaddr_ipv4(cur->ifa_netmask, "255.255.255.255");
+            sc_set_sockaddr_ipv4(cur->ifa_dstaddr, sc_cellularRouter);
+        } else if (sc_networkMode == 1 && sc_is_cell_ifname(cur->ifa_name)) {
+            strlcpy(cur->ifa_name, "en0", IFNAMSIZ);
+        }
+        cur = cur->ifa_next;
+    }
     return r;
+}
+
+static unsigned int (*orig_if_nametoindex)(const char *);
+static unsigned int sc_if_nametoindex_hook(const char *ifname) {
+    if (sc_should_spoof()) {
+        if (sc_networkMode == 2 && sc_is_wifi_ifname(ifname)) {
+            unsigned int idx = orig_if_nametoindex ? orig_if_nametoindex("pdp_ip0") : 0;
+            return idx ?: 0;
+        }
+        if (sc_networkMode == 1 && sc_is_cell_ifname(ifname)) {
+            unsigned int idx = orig_if_nametoindex ? orig_if_nametoindex("en0") : 0;
+            return idx ?: 0;
+        }
+    }
+    return orig_if_nametoindex ? orig_if_nametoindex(ifname) : 0;
+}
+
+static char *(*orig_if_indextoname)(unsigned int, char *);
+static char *sc_if_indextoname_hook(unsigned int ifindex, char *ifname) {
+    char *r = orig_if_indextoname ? orig_if_indextoname(ifindex, ifname) : NULL;
+    if (r && sc_should_spoof()) {
+        if (sc_networkMode == 2 && sc_is_wifi_ifname(r)) {
+            strlcpy(ifname, "pdp_ip0", IFNAMSIZ);
+            return ifname;
+        }
+        if (sc_networkMode == 1 && sc_is_cell_ifname(r)) {
+            strlcpy(ifname, "en0", IFNAMSIZ);
+            return ifname;
+        }
+    }
+    return r;
+}
+
+// Network.framework C API used by Swift NWPathMonitor.
+static nw_path_status_t (*orig_nw_path_get_status)(nw_path_t);
+static nw_path_status_t sc_nw_path_get_status_hook(nw_path_t path) {
+    return 1; // satisfied
+}
+
+static bool (*orig_nw_path_is_expensive)(nw_path_t);
+static bool sc_nw_path_is_expensive_hook(nw_path_t path) {
+    if (sc_should_spoof()) {
+        if (sc_networkMode == 2) return true;
+        if (sc_networkMode == 1) return false;
+    }
+    return false;
+}
+
+static bool (*orig_nw_path_is_constrained)(nw_path_t);
+static bool sc_nw_path_is_constrained_hook(nw_path_t path) {
+    return false;
+}
+
+static bool (*orig_nw_path_uses_interface_type)(nw_path_t, nw_interface_type_t);
+static bool sc_nw_path_uses_interface_type_hook(nw_path_t path, nw_interface_type_t type) {
+    if (sc_should_spoof()) {
+        if (sc_networkMode == 2) {
+            if (type == 2) return true;
+            if (type == 1) return false;
+        } else if (sc_networkMode == 1) {
+            if (type == 1) return true;
+            if (type == 2) return false;
+        }
+    }
+    return false;
+}
+
+static nw_interface_type_t (*orig_nw_interface_get_type)(nw_interface_t);
+static nw_interface_type_t sc_nw_interface_get_type_hook(nw_interface_t interface) {
+    if (sc_should_spoof()) {
+        if (sc_networkMode == 2) return 2;
+        if (sc_networkMode == 1) return 1;
+    }
+    return 0;
+}
+
+static const char *(*orig_nw_interface_get_name)(nw_interface_t);
+static const char *sc_nw_interface_get_name_hook(nw_interface_t interface) {
+    if (sc_should_spoof()) {
+        if (sc_networkMode == 2) return "pdp_ip0";
+        if (sc_networkMode == 1) return "en0";
+    }
+    return NULL;
+}
+
+static CFPropertyListRef (*orig_SCDynamicStoreCopyValue)(SCDynamicStoreRef, CFStringRef);
+static CFPropertyListRef sc_SCDynamicStoreCopyValue_hook(SCDynamicStoreRef store, CFStringRef key) {
+    if (sc_should_spoof() && key) {
+        NSString *k = (__bridge NSString *)key;
+        if (sc_networkMode == 2) {
+            if ([k containsString:@"State:/Network/Global/IPv4"]) {
+                return CFBridgingRetain(sc_cellular_ipv4_dictionary());
+            }
+            if (([k containsString:@"State:/Network/Service"] && [k containsString:@"/IPv4"]) ||
+                [k containsString:@"State:/Network/Interface/pdp_ip0/IPv4"]) {
+                return CFBridgingRetain(sc_cellular_ipv4_dictionary());
+            }
+            if ([k containsString:@"State:/Network/Interface/en0"] ||
+                [k containsString:@"State:/Network/Interface/awdl"] ||
+                [k containsString:@"State:/Network/Interface/llw"] ||
+                [k containsString:@"Setup:/Network/Interface/en0"] ||
+                [k containsString:@"Setup:/Network/Interface/awdl"] ||
+                [k containsString:@"Setup:/Network/Interface/llw"]) {
+                return NULL;
+            }
+        } else if (sc_networkMode == 1) {
+            if ([k containsString:@"State:/Network/Interface/pdp_ip"] ||
+                [k containsString:@"Setup:/Network/Interface/pdp_ip"]) {
+                return NULL;
+            }
+        }
+    }
+    return NULL;
+}
+
+static CFArrayRef (*orig_SCDynamicStoreCopyKeyList)(SCDynamicStoreRef, CFStringRef);
+static CFArrayRef sc_SCDynamicStoreCopyKeyList_hook(SCDynamicStoreRef store, CFStringRef pattern) {
+    return CFArrayCreate(NULL, NULL, 0, NULL);
 }
 
 static void sc_hook_objc_method(Class cls, SEL sel, IMP newImp, IMP *origImp) {
@@ -677,11 +861,17 @@ static void sc_install_objc_hooks(void) {
 
 __attribute__((visibility("default")))
 void iosspoof_system_init(void) {
+    // Marker must be set even when spoofing is disabled, so the companion app
+    // can reliably report that the custom systemhook is installed and loaded.
+    setenv("SC_SYSTEMHOOK_ACTIVE", "1", 1);
+    int marker = open("/var/mobile/Library/Preferences/com.iosspoof.systemhook.active", O_CREAT | O_WRONLY, 0644);
+    if (marker >= 0) {
+        write(marker, "1\n", 2);
+        close(marker);
+    }
+
     sc_load_config();
     if (!sc_enabled) return;
-
-    // Set env var so iOSSpoof tweak knows systemhook is active
-    setenv("SC_SYSTEMHOOK_ACTIVE", "1", 1);
 
     // C function hooks via litehook (invisible to banking apps)
     litehook_hook_function(sysctlbyname, sc_sysctlbyname_hook);
@@ -710,6 +900,10 @@ void iosspoof_system_init(void) {
     // Device identity
     litehook_hook_function(uname, sc_uname_hook);
 
+    // Interface/IP rewrite via getifaddrs needs an original trampoline.
+    // litehook only exposes a 2-argument API, so keep this in user-space mode
+    // until a safe trampoline wrapper is added for systemhook.
+
     // Timestamp spoof
     if (sc_timestamp_offset != 0) {
         litehook_hook_function(time, sc_time_hook);
@@ -720,10 +914,31 @@ void iosspoof_system_init(void) {
     void *scFramework = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_NOW);
     if (scFramework) {
         void *scReach = dlsym(scFramework, "SCNetworkReachabilityGetFlags");
-        if (scReach) litehook_hook_function(scReach, sc_SCNetworkReachabilityGetFlags_hook, (void **)&orig_SCNetworkReachabilityGetFlags);
+        if (scReach) litehook_hook_function(scReach, sc_SCNetworkReachabilityGetFlags_hook);
 
         void *cnInfo = dlsym(scFramework, "CNCopyCurrentNetworkInfo");
-        if (cnInfo) litehook_hook_function(cnInfo, sc_CNCopyCurrentNetworkInfo_hook, (void **)&orig_CNCopyCurrentNetworkInfo);
+        if (cnInfo) litehook_hook_function(cnInfo, sc_CNCopyCurrentNetworkInfo_hook);
+
+        void *copyValue = dlsym(scFramework, "SCDynamicStoreCopyValue");
+        if (copyValue) litehook_hook_function(copyValue, sc_SCDynamicStoreCopyValue_hook);
+        void *copyKeyList = dlsym(scFramework, "SCDynamicStoreCopyKeyList");
+        if (copyKeyList) litehook_hook_function(copyKeyList, sc_SCDynamicStoreCopyKeyList_hook);
+    }
+
+    void *networkFramework = dlopen("/System/Library/Frameworks/Network.framework/Network", RTLD_NOW);
+    if (networkFramework) {
+        void *sym = dlsym(networkFramework, "nw_path_get_status");
+        if (sym) litehook_hook_function(sym, sc_nw_path_get_status_hook);
+        sym = dlsym(networkFramework, "nw_path_is_expensive");
+        if (sym) litehook_hook_function(sym, sc_nw_path_is_expensive_hook);
+        sym = dlsym(networkFramework, "nw_path_is_constrained");
+        if (sym) litehook_hook_function(sym, sc_nw_path_is_constrained_hook);
+        sym = dlsym(networkFramework, "nw_path_uses_interface_type");
+        if (sym) litehook_hook_function(sym, sc_nw_path_uses_interface_type_hook);
+        sym = dlsym(networkFramework, "nw_interface_get_type");
+        if (sym) litehook_hook_function(sym, sc_nw_interface_get_type_hook);
+        sym = dlsym(networkFramework, "nw_interface_get_name");
+        if (sym) litehook_hook_function(sym, sc_nw_interface_get_name_hook);
     }
 
     // ObjC hooks — use method_setImplementation (NOT MSHookFunction)

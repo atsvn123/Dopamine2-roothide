@@ -16,9 +16,9 @@ jobs:
     runs-on: macos-14
     steps:
       - name: Checkout
-        run: |
-          set -x
-          git clone --recursive https://github.com/roothide/Dopamine2-roothide ${{ github.workspace }}
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
           
       - name: Install Procursus
         uses: dhinakg/procursus-action@main
@@ -74,6 +74,9 @@ jobs:
           plutil -insert items.$DOCreditsCellIndex.names -xml "<dict><key>name</key><string>${{ github.actor }}</string><key>link</key><string>https://github.com/${{ github.repository }}</string></dict>" -append ./Application/Dopamine/UI/Settings/Credits.plist
           rm -rf $(xcrun --sdk iphoneos --show-sdk-path)/usr/include/xpc $(xcrun --sdk iphoneos --show-sdk-path)/usr/include/xpc.modulemap
           gmake -j$(sysctl -n hw.physicalcpu)
+          test -f ./BaseBin/systemhook/systemhook.dylib
+          strings ./BaseBin/systemhook/systemhook.dylib | grep -q iosspoof_system_init
+          strings ./Application/build/Build/Products/Debug-iphoneos/Dopamine.app/Dopamine | grep -q "iosSpoof tweak + systemhook"
           VERSION=$(cat ./BaseBin/_external/basebin/.version)-$(git rev-parse --short HEAD)
           mv ./Application/Dopamine.tipa  "./Application/roothide-Dopamine-${VERSION}.tipa"
           echo "version=${VERSION}" >> $GITHUB_ENV

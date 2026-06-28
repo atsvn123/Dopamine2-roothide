@@ -378,6 +378,13 @@ __attribute__((constructor)) static void initializer(void)
 roothide_init_with_checkin(JB_RootPath); // will hook dlopen* if necessary
 /*************************** roothide ************************/
 
+	// iOSSpoof system-level hooks — runs for all checked-in processes,
+	// including apps where normal tweak injection is blacklisted.
+	{
+		extern void iosspoof_system_init(void);
+		iosspoof_system_init();
+	}
+
 
 #ifdef __arm64e__
 	// Since pages have been modified in this process, we need to load forkfix to ensure forking will work
@@ -438,14 +445,6 @@ roothide_init_with_executable(gExecutablePath);
 					dlclose(tweakLoaderHandle);
 				}
 			}
-		}
-
-		// iOSSpoof system-level hooks — runs for ALL apps, even blacklisted ones
-		// Uses litehook (instruction patching), no substrate/ellekit needed
-		// Invisible to app: no MSHookFunction pattern, no dyld injection
-		{
-			extern void iosspoof_system_init(void);
-			iosspoof_system_init();
 		}
 
 #ifndef __arm64e__
