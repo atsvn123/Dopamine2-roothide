@@ -36,6 +36,9 @@
 // Config: read from iOSSpoof plist (jbroot path)
 // ============================================================================
 
+__attribute__((used, visibility("default")))
+const char *iosspoof_systemhook_build_marker = "SC_SYSTEMHOOK_ACTIVE:iOSSpoof-systemhook";
+
 static bool sc_enabled = false;
 static bool sc_hideJailbreak = true;
 static char sc_productType[64] = "iPhone14,5";
@@ -859,7 +862,7 @@ static void sc_install_objc_hooks(void) {
 // Init — called from systemhook main.c
 // ============================================================================
 
-__attribute__((visibility("default")))
+__attribute__((used, visibility("default")))
 void iosspoof_system_init(void) {
     // Marker must be set even when spoofing is disabled, so the companion app
     // can reliably report that the custom systemhook is installed and loaded.

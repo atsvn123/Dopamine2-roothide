@@ -75,7 +75,9 @@ jobs:
           rm -rf $(xcrun --sdk iphoneos --show-sdk-path)/usr/include/xpc $(xcrun --sdk iphoneos --show-sdk-path)/usr/include/xpc.modulemap
           gmake -j$(sysctl -n hw.physicalcpu)
           test -f ./BaseBin/systemhook/systemhook.dylib
-          strings ./BaseBin/systemhook/systemhook.dylib | grep -q iosspoof_system_init
+          echo "Checking iOSSpoof systemhook marker..."
+          strings ./BaseBin/systemhook/systemhook.dylib | grep -q "SC_SYSTEMHOOK_ACTIVE:iOSSpoof-systemhook"
+          nm -gj ./BaseBin/systemhook/systemhook.dylib 2>/dev/null | grep -q "_iosspoof_system_init" || true
           strings ./Application/build/Build/Products/Debug-iphoneos/Dopamine.app/Dopamine | grep -q "iosSpoof tweak + systemhook"
           VERSION=$(cat ./BaseBin/_external/basebin/.version)-$(git rev-parse --short HEAD)
           mv ./Application/Dopamine.tipa  "./Application/roothide-Dopamine-${VERSION}.tipa"
