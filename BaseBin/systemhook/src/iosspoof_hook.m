@@ -28,6 +28,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <UIKit/UIKit.h>
 #include <SystemConfiguration/SystemConfiguration.h>
+#include <CoreLocation/CoreLocation.h>
 
 #include "litehook.h"
 #include "common.h"
@@ -42,7 +43,11 @@ const char *iosspoof_systemhook_build_marker = "SC_SYSTEMHOOK_ACTIVE:iOSSpoof-sy
 static bool sc_enabled = false;
 static bool sc_kernelMode = false;
 static bool sc_hideJailbreak = true;
+static bool sc_hideProxy = true;
+static bool sc_hideVPN = true;
 static bool sc_spoofWebKit = false;
+static bool sc_geoEnabled = false;
+static bool sc_spoofBattery = true;
 static bool sc_prefsFound = false;
 static CFArrayRef sc_targetBundles = NULL;
 static char sc_productType[64] = "iPhone14,5";
@@ -51,6 +56,7 @@ static char sc_marketingName[64] = "iPhone 13";
 static char sc_deviceName[128] = "";
 static char sc_serial[64] = "";
 static char sc_udid[64] = "";
+static char sc_pasteboardUUID[64] = "";
 static char sc_systemVersion[16] = "17.5";
 static char sc_buildID[16] = "21F90";
 static char sc_carrierName[64] = "Viettel";
@@ -73,6 +79,13 @@ static char sc_wifiBSSID[32] = "02:00:00:00:00:00";
 static char sc_cellularServiceID[64] = "00000000-0000-0000-0000-000000000000";
 static char sc_cellularIPv4[32] = "10.23.42.10";
 static char sc_cellularRouter[32] = "10.23.42.1";
+static unsigned long long sc_totalStorageGB = 0;
+static unsigned long long sc_freeStorageGB = 0;
+static double sc_latitude = 21.0285;
+static double sc_longitude = 105.8542;
+static double sc_altitude = 20.0;
+static double sc_horizontalAccuracy = 5.0;
+static double sc_heading = 0.0;
 static char sc_locale[32] = "";
 static char sc_timezone[64] = "";
 static long sc_timestamp_offset = 0;
@@ -141,6 +154,44 @@ static NSString *sc_native_user_agent(void) {
     NSString *version = [NSString stringWithUTF8String:sc_systemVersion[0] ? sc_systemVersion : "17.5"];
     NSString *v = [version stringByReplacingOccurrencesOfString:@"." withString:@"_"];
     return [NSString stringWithFormat:@"Mozilla/5.0 (iPhone; CPU iPhone OS %@ like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/%@ Mobile/15E148 Safari/604.1", v, version];
+}
+
+static unsigned long long sc_total_bytes(void) {
+    return sc_totalStorageGB > 0 ? sc_totalStorageGB * 1024ULL * 1024ULL * 1024ULL : 256ULL * 1024ULL * 1024ULL * 1024ULL;
+}
+
+static unsigned long long sc_free_bytes(void) {
+    if (sc_freeStorageGB > 0) return sc_freeStorageGB * 1024ULL * 1024ULL * 1024ULL;
+    return sc_total_bytes() / 3;
+}
+
+static NSOperatingSystemVersion sc_fake_os_version(void) {
+    NSString *version = [NSString stringWithUTF8String:sc_systemVersion[0] ? sc_systemVersion : "17.5"];
+    NSArray<NSString *> *parts = [version componentsSeparatedByString:@"."];
+    NSOperatingSystemVersion v = {17, 5, 0};
+    if (parts.count > 0) v.majorVersion = [parts[0] integerValue];
+    if (parts.count > 1) v.minorVersion = [parts[1] integerValue];
+    if (parts.count > 2) v.patchVersion = [parts[2] integerValue];
+    return v;
+}
+
+static NSDictionary *sc_fake_system_version_dictionary(void) {
+    NSString *version = [NSString stringWithUTF8String:sc_systemVersion[0] ? sc_systemVersion : "17.5"];
+    NSString *build = [NSString stringWithUTF8String:sc_buildID[0] ? sc_buildID : "21F90"];
+    return @{ @"ProductName": @"iPhone OS", @"ProductVersion": version, @"ProductBuildVersion": build };
+}
+
+static float sc_fake_battery_level(void) {
+    const char *seed = sc_pasteboardUUID[0] ? sc_pasteboardUUID : sc_productType;
+    uint32_t h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)seed; p && *p; p++) { h ^= *p; h *= 16777619u; }
+    return 0.35f + ((h % 63u) / 100.0f);
+}
+
+static CLLocation *sc_fake_location(void) {
+    CLLocationCoordinate2D coord = CLLocationCoordinate2DMake(sc_latitude, sc_longitude);
+    CLLocationAccuracy acc = sc_horizontalAccuracy > 0 ? sc_horizontalAccuracy : 5.0;
+    return [[CLLocation alloc] initWithCoordinate:coord altitude:sc_altitude horizontalAccuracy:acc verticalAccuracy:acc course:sc_heading speed:0 timestamp:[NSDate date]];
 }
 
 static void sc_set_sockaddr_ipv4(struct sockaddr *addr, const char *ip) {
@@ -215,8 +266,20 @@ static void sc_load_config(void) {
     CFBooleanRef hj = CFDictionaryGetValue(d, CFSTR("hideJailbreak"));
     if (hj) sc_hideJailbreak = CFBooleanGetValue(hj);
 
+    CFBooleanRef hp = CFDictionaryGetValue(d, CFSTR("hideProxy"));
+    if (hp) sc_hideProxy = CFBooleanGetValue(hp);
+
+    CFBooleanRef hv = CFDictionaryGetValue(d, CFSTR("hideVPN"));
+    if (hv) sc_hideVPN = CFBooleanGetValue(hv);
+
     CFBooleanRef wk = CFDictionaryGetValue(d, CFSTR("spoofWebKit"));
     if (wk) sc_spoofWebKit = CFBooleanGetValue(wk);
+
+    CFBooleanRef geo = CFDictionaryGetValue(d, CFSTR("geoEnabled"));
+    if (geo) sc_geoEnabled = CFBooleanGetValue(geo);
+
+    CFBooleanRef bat = CFDictionaryGetValue(d, CFSTR("spoofBattery"));
+    if (bat) sc_spoofBattery = CFBooleanGetValue(bat);
 
     CFStringRef pt = CFDictionaryGetValue(d, CFSTR("productType"));
     if (pt) CFStringGetCString(pt, sc_productType, sizeof(sc_productType), kCFStringEncodingUTF8);
@@ -235,6 +298,9 @@ static void sc_load_config(void) {
 
     CFStringRef bi = CFDictionaryGetValue(d, CFSTR("buildID"));
     if (bi) CFStringGetCString(bi, sc_buildID, sizeof(sc_buildID), kCFStringEncodingUTF8);
+
+    CFStringRef pb = CFDictionaryGetValue(d, CFSTR("pasteboardUUID"));
+    if (pb) CFStringGetCString(pb, sc_pasteboardUUID, sizeof(sc_pasteboardUUID), kCFStringEncodingUTF8);
 
     CFStringRef cn = CFDictionaryGetValue(d, CFSTR("carrierName"));
     if (cn) CFStringGetCString(cn, sc_carrierName, sizeof(sc_carrierName), kCFStringEncodingUTF8);
@@ -291,6 +357,23 @@ static void sc_load_config(void) {
 
     CFStringRef cr = CFDictionaryGetValue(d, CFSTR("cellularRouter"));
     if (cr) CFStringGetCString(cr, sc_cellularRouter, sizeof(sc_cellularRouter), kCFStringEncodingUTF8);
+
+    CFNumberRef total = CFDictionaryGetValue(d, CFSTR("totalStorage"));
+    if (total) CFNumberGetValue(total, kCFNumberLongLongType, &sc_totalStorageGB);
+
+    CFNumberRef free = CFDictionaryGetValue(d, CFSTR("freeStorage"));
+    if (free) CFNumberGetValue(free, kCFNumberLongLongType, &sc_freeStorageGB);
+
+    CFNumberRef lat = CFDictionaryGetValue(d, CFSTR("latitude"));
+    if (lat) CFNumberGetValue(lat, kCFNumberDoubleType, &sc_latitude);
+    CFNumberRef lon = CFDictionaryGetValue(d, CFSTR("longitude"));
+    if (lon) CFNumberGetValue(lon, kCFNumberDoubleType, &sc_longitude);
+    CFNumberRef alt = CFDictionaryGetValue(d, CFSTR("altitude"));
+    if (alt) CFNumberGetValue(alt, kCFNumberDoubleType, &sc_altitude);
+    CFNumberRef acc = CFDictionaryGetValue(d, CFSTR("horizontalAccuracy"));
+    if (acc) CFNumberGetValue(acc, kCFNumberDoubleType, &sc_horizontalAccuracy);
+    CFNumberRef heading = CFDictionaryGetValue(d, CFSTR("heading"));
+    if (heading) CFNumberGetValue(heading, kCFNumberDoubleType, &sc_heading);
 
     CFStringRef loc = CFDictionaryGetValue(d, CFSTR("localeIdentifier"));
     if (loc) CFStringGetCString(loc, sc_locale, sizeof(sc_locale), kCFStringEncodingUTF8);
@@ -619,9 +702,8 @@ static unsigned long long sc_fake_free_bytes = 0;
 
 static void sc_calc_storage(void) {
     if (sc_fake_total_bytes > 0) return;
-    // Default: 256GB total, 85GB free
-    sc_fake_total_bytes = 256ULL * 1024ULL * 1024ULL * 1024ULL;
-    sc_fake_free_bytes = 85ULL * 1024ULL * 1024ULL * 1024ULL;
+    sc_fake_total_bytes = sc_total_bytes();
+    sc_fake_free_bytes = sc_free_bytes();
 }
 
 int (*orig_statfs_sc)(const char *, struct statfs *);
@@ -730,6 +812,18 @@ CFPropertyListRef sc_CFPreferencesCopyAppValue_hook(CFStringRef key, CFStringRef
     return orig_CFPreferencesCopyAppValue_sc ? orig_CFPreferencesCopyAppValue_sc(key, applicationID) : NULL;
 }
 
+CFDictionaryRef (*orig_CFCopySystemVersionDictionary_sc)(void);
+CFDictionaryRef sc_CFCopySystemVersionDictionary_hook(void) {
+    if (sc_should_spoof()) return CFBridgingRetain(sc_fake_system_version_dictionary());
+    return orig_CFCopySystemVersionDictionary_sc ? orig_CFCopySystemVersionDictionary_sc() : NULL;
+}
+
+CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings_sc)(void);
+CFDictionaryRef sc_CFNetworkCopySystemProxySettings_hook(void) {
+    if (sc_should_spoof() && sc_hideProxy) return CFDictionaryCreate(NULL, NULL, NULL, 0, NULL, NULL);
+    return orig_CFNetworkCopySystemProxySettings_sc ? orig_CFNetworkCopySystemProxySettings_sc() : NULL;
+}
+
 // ============================================================================
 // ObjC hooks — use method_exchangeImplementations (NOT MSHookFunction)
 // This is invisible to banking apps — no instruction pattern to detect
@@ -752,6 +846,18 @@ static NSString *(*orig_UIDevice_systemVersion)(id, SEL);
 static NSString *sc_UIDevice_systemVersion(id self, SEL _cmd) {
     if (sc_should_spoof()) return [NSString stringWithUTF8String:sc_systemVersion];
     return orig_UIDevice_systemVersion(self, _cmd);
+}
+
+static float (*orig_UIDevice_batteryLevel)(id, SEL);
+static float sc_UIDevice_batteryLevel(id self, SEL _cmd) {
+    if (sc_should_spoof() && sc_spoofBattery) return sc_fake_battery_level();
+    return orig_UIDevice_batteryLevel ? orig_UIDevice_batteryLevel(self, _cmd) : -1.0f;
+}
+
+static NSInteger (*orig_UIDevice_batteryState)(id, SEL);
+static NSInteger sc_UIDevice_batteryState(id self, SEL _cmd) {
+    if (sc_should_spoof() && sc_spoofBattery) return 2; // charging
+    return orig_UIDevice_batteryState ? orig_UIDevice_batteryState(self, _cmd) : 0;
 }
 
 static NSString *(*orig_UIDevice_name)(id, SEL);
@@ -780,6 +886,69 @@ static NSUInteger sc_NSProcessInfo_processorCount(id self, SEL _cmd) {
     if (sc_should_spoof()) return 6;
     return orig_NSProcessInfo_processorCount(self, _cmd);
 }
+
+static NSOperatingSystemVersion (*orig_NSProcessInfo_operatingSystemVersion)(id, SEL);
+static NSOperatingSystemVersion sc_NSProcessInfo_operatingSystemVersion(id self, SEL _cmd) {
+    if (sc_should_spoof()) return sc_fake_os_version();
+    return orig_NSProcessInfo_operatingSystemVersion ? orig_NSProcessInfo_operatingSystemVersion(self, _cmd) : sc_fake_os_version();
+}
+
+static BOOL (*orig_NSProcessInfo_isOperatingSystemAtLeastVersion)(id, SEL, NSOperatingSystemVersion);
+static BOOL sc_NSProcessInfo_isOperatingSystemAtLeastVersion(id self, SEL _cmd, NSOperatingSystemVersion version) {
+    if (sc_should_spoof()) {
+        NSOperatingSystemVersion current = sc_fake_os_version();
+        if (current.majorVersion != version.majorVersion) return current.majorVersion > version.majorVersion;
+        if (current.minorVersion != version.minorVersion) return current.minorVersion > version.minorVersion;
+        return current.patchVersion >= version.patchVersion;
+    }
+    return orig_NSProcessInfo_isOperatingSystemAtLeastVersion ? orig_NSProcessInfo_isOperatingSystemAtLeastVersion(self, _cmd, version) : NO;
+}
+
+// CoreLocation
+static CLLocation *(*orig_CLLocationManager_location)(id, SEL);
+static CLLocation *sc_CLLocationManager_location(id self, SEL _cmd) {
+    if (sc_should_spoof() && sc_geoEnabled) return sc_fake_location();
+    return orig_CLLocationManager_location ? orig_CLLocationManager_location(self, _cmd) : nil;
+}
+
+static void (*orig_CLLocationManager_startUpdatingLocation)(id, SEL);
+static void sc_CLLocationManager_startUpdatingLocation(id self, SEL _cmd) {
+    if (orig_CLLocationManager_startUpdatingLocation) orig_CLLocationManager_startUpdatingLocation(self, _cmd);
+    if (sc_should_spoof() && sc_geoEnabled) {
+        id del = ((id (*)(id, SEL))objc_msgSend)(self, @selector(delegate));
+        CLLocation *loc = sc_fake_location();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if ([del respondsToSelector:@selector(locationManager:didUpdateLocations:)]) {
+                ((void (*)(id, SEL, id, NSArray *))objc_msgSend)(del, @selector(locationManager:didUpdateLocations:), self, @[loc]);
+            }
+        });
+    }
+}
+
+static void (*orig_CLLocationManager_requestLocation)(id, SEL);
+static void sc_CLLocationManager_requestLocation(id self, SEL _cmd) {
+    if (orig_CLLocationManager_requestLocation) orig_CLLocationManager_requestLocation(self, _cmd);
+    sc_CLLocationManager_startUpdatingLocation(self, _cmd);
+}
+
+static BOOL (*orig_CLLocationManager_locationServicesEnabled)(id, SEL);
+static BOOL sc_CLLocationManager_locationServicesEnabled(id self, SEL _cmd) { return sc_should_spoof() && sc_geoEnabled ? YES : (orig_CLLocationManager_locationServicesEnabled ? orig_CLLocationManager_locationServicesEnabled(self, _cmd) : YES); }
+
+static int (*orig_CLLocationManager_authorizationStatus)(id, SEL);
+static int sc_CLLocationManager_authorizationStatus(id self, SEL _cmd) { return sc_should_spoof() && sc_geoEnabled ? 3 : (orig_CLLocationManager_authorizationStatus ? orig_CLLocationManager_authorizationStatus(self, _cmd) : 0); }
+
+static CLLocationCoordinate2D (*orig_CLLocation_coordinate)(id, SEL);
+static CLLocationCoordinate2D sc_CLLocation_coordinate(id self, SEL _cmd) { return sc_should_spoof() && sc_geoEnabled ? CLLocationCoordinate2DMake(sc_latitude, sc_longitude) : orig_CLLocation_coordinate(self, _cmd); }
+static CLLocationDistance (*orig_CLLocation_altitude)(id, SEL);
+static CLLocationDistance sc_CLLocation_altitude(id self, SEL _cmd) { return sc_should_spoof() && sc_geoEnabled ? sc_altitude : orig_CLLocation_altitude(self, _cmd); }
+static CLLocationAccuracy (*orig_CLLocation_horizontalAccuracy)(id, SEL);
+static CLLocationAccuracy sc_CLLocation_horizontalAccuracy(id self, SEL _cmd) { return sc_should_spoof() && sc_geoEnabled ? (sc_horizontalAccuracy > 0 ? sc_horizontalAccuracy : 5.0) : orig_CLLocation_horizontalAccuracy(self, _cmd); }
+static CLLocationAccuracy (*orig_CLLocation_verticalAccuracy)(id, SEL);
+static CLLocationAccuracy sc_CLLocation_verticalAccuracy(id self, SEL _cmd) { return sc_should_spoof() && sc_geoEnabled ? (sc_horizontalAccuracy > 0 ? sc_horizontalAccuracy : 5.0) : orig_CLLocation_verticalAccuracy(self, _cmd); }
+static CLLocationDirection (*orig_CLLocation_course)(id, SEL);
+static CLLocationDirection sc_CLLocation_course(id self, SEL _cmd) { return sc_should_spoof() && sc_geoEnabled ? sc_heading : orig_CLLocation_course(self, _cmd); }
+static CLLocationSpeed (*orig_CLLocation_speed)(id, SEL);
+static CLLocationSpeed sc_CLLocation_speed(id self, SEL _cmd) { return sc_should_spoof() && sc_geoEnabled ? 0 : orig_CLLocation_speed(self, _cmd); }
 
 // NSLocale / NSTimeZone
 static NSString *(*orig_NSLocale_localeIdentifier)(id, SEL);
@@ -878,6 +1047,55 @@ static NSString *(*orig_SFUserAgent_class_string)(id, SEL);
 static NSString *sc_SFUserAgent_class_string(id self, SEL _cmd) {
     if (sc_should_spoof() && sc_spoofWebKit) return sc_native_user_agent();
     return orig_SFUserAgent_class_string ? orig_SFUserAgent_class_string(self, _cmd) : nil;
+}
+
+// NSFileManager / NSURL storage capacity
+static NSDictionary *(*orig_NSFileManager_attributesOfFileSystemForPath)(id, SEL, NSString *, NSError **);
+static NSDictionary *sc_NSFileManager_attributesOfFileSystemForPath(id self, SEL _cmd, NSString *path, NSError **error) {
+    NSDictionary *d = orig_NSFileManager_attributesOfFileSystemForPath ? orig_NSFileManager_attributesOfFileSystemForPath(self, _cmd, path, error) : nil;
+    if (sc_should_spoof()) {
+        NSMutableDictionary *m = [NSMutableDictionary dictionaryWithDictionary:d ?: @{}];
+        m[NSFileSystemSize] = @(sc_total_bytes());
+        m[NSFileSystemFreeSize] = @(sc_free_bytes());
+        return m;
+    }
+    return d;
+}
+
+static BOOL (*orig_NSURL_getResourceValue)(id, SEL, id *, NSURLResourceKey, NSError **);
+static BOOL sc_NSURL_getResourceValue(id self, SEL _cmd, id *value, NSURLResourceKey key, NSError **error) {
+    BOOL ok = orig_NSURL_getResourceValue ? orig_NSURL_getResourceValue(self, _cmd, value, key, error) : NO;
+    if (sc_should_spoof() && value) {
+        if ([key isEqualToString:NSURLVolumeTotalCapacityKey]) *value = @(sc_total_bytes());
+        else if ([key isEqualToString:NSURLVolumeAvailableCapacityKey]) *value = @(sc_free_bytes());
+        else if (@available(iOS 11.0, *)) {
+            if ([key isEqualToString:NSURLVolumeAvailableCapacityForImportantUsageKey]) *value = @(sc_free_bytes());
+            else if ([key isEqualToString:NSURLVolumeAvailableCapacityForOpportunisticUsageKey]) *value = @(sc_free_bytes());
+        }
+        ok = YES;
+    }
+    return ok;
+}
+
+static NSUUID *(*orig_UIPasteboard_uniquePasteboardUUID)(id, SEL);
+static NSUUID *sc_UIPasteboard_uniquePasteboardUUID(id self, SEL _cmd) {
+    if (sc_should_spoof() && sc_pasteboardUUID[0]) return [[NSUUID alloc] initWithUUIDString:[NSString stringWithUTF8String:sc_pasteboardUUID]];
+    return orig_UIPasteboard_uniquePasteboardUUID ? orig_UIPasteboard_uniquePasteboardUUID(self, _cmd) : nil;
+}
+
+static id (*orig_UIPasteboard_valueForPasteboardType)(id, SEL, NSString *);
+static id sc_UIPasteboard_valueForPasteboardType(id self, SEL _cmd, NSString *type) {
+    if (sc_should_spoof() && sc_pasteboardUUID[0] && [type isEqualToString:@"com.apple.uikit.pboard-uuid"]) {
+        NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:[NSString stringWithUTF8String:sc_pasteboardUUID]];
+        return [NSKeyedArchiver archivedDataWithRootObject:uuid];
+    }
+    return orig_UIPasteboard_valueForPasteboardType ? orig_UIPasteboard_valueForPasteboardType(self, _cmd, type) : nil;
+}
+
+static NSInteger (*orig_NEVPNConnection_status)(id, SEL);
+static NSInteger sc_NEVPNConnection_status(id self, SEL _cmd) {
+    if (sc_should_spoof() && sc_hideVPN) return 1; // NEVPNStatusDisconnected
+    return orig_NEVPNConnection_status ? orig_NEVPNConnection_status(self, _cmd) : 1;
 }
 
 // NWPath / NWInterface — cellular fake
@@ -1298,6 +1516,10 @@ static void sc_install_c_rebind_hooks(void) {
     orig_time_sc = time;
     orig_gettimeofday_sc = gettimeofday;
     orig_CFPreferencesCopyAppValue_sc = CFPreferencesCopyAppValue;
+    void *cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW);
+    if (cf) orig_CFCopySystemVersionDictionary_sc = (CFDictionaryRef (*)(void))dlsym(cf, "CFCopySystemVersionDictionary");
+    void *cfnet = dlopen("/System/Library/Frameworks/CFNetwork.framework/CFNetwork", RTLD_NOW);
+    if (cfnet) orig_CFNetworkCopySystemProxySettings_sc = (CFDictionaryRef (*)(void))dlsym(cfnet, "CFNetworkCopySystemProxySettings");
     orig_getifaddrs = getifaddrs;
     orig_if_nametoindex = if_nametoindex;
     orig_if_indextoname = if_indextoname;
@@ -1329,6 +1551,8 @@ static void sc_install_c_rebind_hooks(void) {
         sc_rebind_symbol((void *)gettimeofday, (void *)sc_gettimeofday_hook);
     }
     sc_rebind_symbol((void *)CFPreferencesCopyAppValue, (void *)sc_CFPreferencesCopyAppValue_hook);
+    if (orig_CFCopySystemVersionDictionary_sc) sc_rebind_symbol((void *)orig_CFCopySystemVersionDictionary_sc, (void *)sc_CFCopySystemVersionDictionary_hook);
+    if (orig_CFNetworkCopySystemProxySettings_sc) sc_rebind_symbol((void *)orig_CFNetworkCopySystemProxySettings_sc, (void *)sc_CFNetworkCopySystemProxySettings_hook);
 }
 
 static void sc_install_objc_hooks(void) {
@@ -1339,14 +1563,37 @@ static void sc_install_objc_hooks(void) {
         sc_hook_objc_method(uiDevice, @selector(localizedModel), (IMP)sc_UIDevice_localizedModel, (IMP *)&orig_UIDevice_localizedModel);
         sc_hook_objc_method(uiDevice, @selector(systemVersion), (IMP)sc_UIDevice_systemVersion, (IMP *)&orig_UIDevice_systemVersion);
         sc_hook_objc_method(uiDevice, @selector(name), (IMP)sc_UIDevice_name, (IMP *)&orig_UIDevice_name);
+        sc_hook_objc_method(uiDevice, @selector(batteryLevel), (IMP)sc_UIDevice_batteryLevel, (IMP *)&orig_UIDevice_batteryLevel);
+        sc_hook_objc_method(uiDevice, @selector(batteryState), (IMP)sc_UIDevice_batteryState, (IMP *)&orig_UIDevice_batteryState);
     }
 
     // NSProcessInfo
     Class procInfo = objc_getClass("NSProcessInfo");
     if (procInfo) {
         sc_hook_objc_method(procInfo, @selector(operatingSystemVersionString), (IMP)sc_NSProcessInfo_operatingSystemVersionString, (IMP *)&orig_NSProcessInfo_operatingSystemVersionString);
+        sc_hook_objc_method(procInfo, @selector(operatingSystemVersion), (IMP)sc_NSProcessInfo_operatingSystemVersion, (IMP *)&orig_NSProcessInfo_operatingSystemVersion);
+        sc_hook_objc_method(procInfo, @selector(isOperatingSystemAtLeastVersion:), (IMP)sc_NSProcessInfo_isOperatingSystemAtLeastVersion, (IMP *)&orig_NSProcessInfo_isOperatingSystemAtLeastVersion);
         sc_hook_objc_method(procInfo, @selector(physicalMemory), (IMP)sc_NSProcessInfo_physicalMemory, (IMP *)&orig_NSProcessInfo_physicalMemory);
         sc_hook_objc_method(procInfo, @selector(processorCount), (IMP)sc_NSProcessInfo_processorCount, (IMP *)&orig_NSProcessInfo_processorCount);
+    }
+
+    Class locMgr = objc_getClass("CLLocationManager");
+    if (locMgr) {
+        sc_hook_objc_method(locMgr, @selector(location), (IMP)sc_CLLocationManager_location, (IMP *)&orig_CLLocationManager_location);
+        sc_hook_objc_method(locMgr, @selector(startUpdatingLocation), (IMP)sc_CLLocationManager_startUpdatingLocation, (IMP *)&orig_CLLocationManager_startUpdatingLocation);
+        sc_hook_objc_method(locMgr, @selector(requestLocation), (IMP)sc_CLLocationManager_requestLocation, (IMP *)&orig_CLLocationManager_requestLocation);
+        sc_hook_objc_class_method(locMgr, @selector(locationServicesEnabled), (IMP)sc_CLLocationManager_locationServicesEnabled, (IMP *)&orig_CLLocationManager_locationServicesEnabled);
+        sc_hook_objc_class_method(locMgr, @selector(authorizationStatus), (IMP)sc_CLLocationManager_authorizationStatus, (IMP *)&orig_CLLocationManager_authorizationStatus);
+    }
+
+    Class clLoc = objc_getClass("CLLocation");
+    if (clLoc) {
+        sc_hook_objc_method(clLoc, @selector(coordinate), (IMP)sc_CLLocation_coordinate, (IMP *)&orig_CLLocation_coordinate);
+        sc_hook_objc_method(clLoc, @selector(altitude), (IMP)sc_CLLocation_altitude, (IMP *)&orig_CLLocation_altitude);
+        sc_hook_objc_method(clLoc, @selector(horizontalAccuracy), (IMP)sc_CLLocation_horizontalAccuracy, (IMP *)&orig_CLLocation_horizontalAccuracy);
+        sc_hook_objc_method(clLoc, @selector(verticalAccuracy), (IMP)sc_CLLocation_verticalAccuracy, (IMP *)&orig_CLLocation_verticalAccuracy);
+        sc_hook_objc_method(clLoc, @selector(course), (IMP)sc_CLLocation_course, (IMP *)&orig_CLLocation_course);
+        sc_hook_objc_method(clLoc, @selector(speed), (IMP)sc_CLLocation_speed, (IMP *)&orig_CLLocation_speed);
     }
 
     Class locale = objc_getClass("NSLocale");
@@ -1374,6 +1621,21 @@ static void sc_install_objc_hooks(void) {
     if (sessionConfig) {
         sc_hook_objc_method(sessionConfig, @selector(HTTPAdditionalHeaders), (IMP)sc_NSURLSessionConfiguration_HTTPAdditionalHeaders, (IMP *)&orig_NSURLSessionConfiguration_HTTPAdditionalHeaders);
     }
+
+    Class fm = objc_getClass("NSFileManager");
+    if (fm) sc_hook_objc_method(fm, @selector(attributesOfFileSystemForPath:error:), (IMP)sc_NSFileManager_attributesOfFileSystemForPath, (IMP *)&orig_NSFileManager_attributesOfFileSystemForPath);
+
+    Class url = objc_getClass("NSURL");
+    if (url) sc_hook_objc_method(url, @selector(getResourceValue:forKey:error:), (IMP)sc_NSURL_getResourceValue, (IMP *)&orig_NSURL_getResourceValue);
+
+    Class pasteboard = objc_getClass("UIPasteboard");
+    if (pasteboard) {
+        sc_hook_objc_method(pasteboard, NSSelectorFromString(@"uniquePasteboardUUID"), (IMP)sc_UIPasteboard_uniquePasteboardUUID, (IMP *)&orig_UIPasteboard_uniquePasteboardUUID);
+        sc_hook_objc_method(pasteboard, @selector(valueForPasteboardType:), (IMP)sc_UIPasteboard_valueForPasteboardType, (IMP *)&orig_UIPasteboard_valueForPasteboardType);
+    }
+
+    Class vpnConn = objc_getClass("NEVPNConnection");
+    if (vpnConn) sc_hook_objc_method(vpnConn, @selector(status), (IMP)sc_NEVPNConnection_status, (IMP *)&orig_NEVPNConnection_status);
 
     Class sf = objc_getClass("SFUserAgentController");
     if (sf) {

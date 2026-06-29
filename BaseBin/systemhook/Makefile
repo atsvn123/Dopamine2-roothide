@@ -2,7 +2,7 @@ TARGET = systemhook.dylib
 CC = clang
 
 CFLAGS = -I../.include -I./src -I../_external/modules/litehook/src -isysroot $(shell xcrun --sdk iphoneos --show-sdk-path) -arch arm64 -arch arm64e -miphoneos-version-min=15.0 -install_name $(TARGET) -Wno-deprecated-declarations -Os -moutline -fobjc-arc
-LDFLAGS = -dynamiclib -framework UIKit -framework SystemConfiguration -framework CoreFoundation -framework CoreTelephony
+LDFLAGS = -dynamiclib -framework UIKit -framework SystemConfiguration -framework CoreFoundation -framework CoreTelephony -framework CoreLocation
 
 sign: $(TARGET)
 	@ldid -S $^
