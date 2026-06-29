@@ -28,10 +28,18 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <UIKit/UIKit.h>
 #include <SystemConfiguration/SystemConfiguration.h>
-#include <CoreLocation/CoreLocation.h>
+#include <dispatch/dispatch.h>
 
 #include "litehook.h"
 #include "common.h"
+
+#ifndef SC_ENABLE_RISKY_APP_HOOKS
+#define SC_ENABLE_RISKY_APP_HOOKS 1
+#endif
+
+#if SC_ENABLE_RISKY_APP_HOOKS
+#include <CoreLocation/CoreLocation.h>
+#endif
 
 // ============================================================================
 // Config: read from iOSSpoof plist (jbroot path)
@@ -91,6 +99,8 @@ static char sc_timezone[64] = "";
 static long sc_timestamp_offset = 0;
 static bool sc_configLoaded = false;
 static bool sc_hooksInstalled = false;
+static bool sc_processDecisionMade = false;
+static bool sc_processShouldSpoof = false;
 
 static bool sc_is_wifi_ifname(const char *name) {
     return name && (!strcmp(name, "en0") || !strncmp(name, "awdl", 4) || !strncmp(name, "llw", 3));
@@ -188,11 +198,13 @@ static float sc_fake_battery_level(void) {
     return 0.35f + ((h % 63u) / 100.0f);
 }
 
+#if SC_ENABLE_RISKY_APP_HOOKS
 static CLLocation *sc_fake_location(void) {
     CLLocationCoordinate2D coord = CLLocationCoordinate2DMake(sc_latitude, sc_longitude);
     CLLocationAccuracy acc = sc_horizontalAccuracy > 0 ? sc_horizontalAccuracy : 5.0;
     return [[CLLocation alloc] initWithCoordinate:coord altitude:sc_altitude horizontalAccuracy:acc verticalAccuracy:acc course:sc_heading speed:0 timestamp:[NSDate date]];
 }
+#endif
 
 static void sc_set_sockaddr_ipv4(struct sockaddr *addr, const char *ip) {
     if (!addr || addr->sa_family != AF_INET || !ip) return;
@@ -474,6 +486,10 @@ static bool sc_is_webkit_helper_process(const char *bid) {
 
 // Check if current process should be spoofed
 static bool sc_should_spoof(void) {
+    if (sc_processDecisionMade) return sc_processShouldSpoof;
+    sc_processDecisionMade = true;
+    sc_processShouldSpoof = false;
+
     if (!sc_prefsFound || !sc_enabled || !sc_kernelMode) return false;
     if (sc_is_critical_executable()) return false;
 
@@ -481,11 +497,13 @@ static bool sc_should_spoof(void) {
     bool hasBid = sc_copy_current_bundle_id(bid, sizeof(bid));
     if (!hasBid) bid[0] = '\0';
     if (sc_is_webkit_helper_process(bid)) {
-        return sc_spoofWebKit && (sc_target_contains_bundle("com.apple.mobilesafari") || sc_target_contains_bundle("com.apple.SafariViewService"));
+        sc_processShouldSpoof = sc_spoofWebKit && (sc_target_contains_bundle("com.apple.mobilesafari") || sc_target_contains_bundle("com.apple.SafariViewService"));
+        return sc_processShouldSpoof;
     }
     if (!hasBid) return false;
     if (sc_is_protected_bundle_id(bid)) return false;
     if (!sc_bundle_is_targeted(bid)) return false;
+    sc_processShouldSpoof = true;
     return true;
 }
 
@@ -905,6 +923,7 @@ static BOOL sc_NSProcessInfo_isOperatingSystemAtLeastVersion(id self, SEL _cmd, 
 }
 
 // CoreLocation
+#if SC_ENABLE_RISKY_APP_HOOKS
 static CLLocation *(*orig_CLLocationManager_location)(id, SEL);
 static CLLocation *sc_CLLocationManager_location(id self, SEL _cmd) {
     if (sc_should_spoof() && sc_geoEnabled) return sc_fake_location();
@@ -949,6 +968,7 @@ static CLLocationDirection (*orig_CLLocation_course)(id, SEL);
 static CLLocationDirection sc_CLLocation_course(id self, SEL _cmd) { return sc_should_spoof() && sc_geoEnabled ? sc_heading : orig_CLLocation_course(self, _cmd); }
 static CLLocationSpeed (*orig_CLLocation_speed)(id, SEL);
 static CLLocationSpeed sc_CLLocation_speed(id self, SEL _cmd) { return sc_should_spoof() && sc_geoEnabled ? 0 : orig_CLLocation_speed(self, _cmd); }
+#endif
 
 // NSLocale / NSTimeZone
 static NSString *(*orig_NSLocale_localeIdentifier)(id, SEL);
@@ -1518,8 +1538,10 @@ static void sc_install_c_rebind_hooks(void) {
     orig_CFPreferencesCopyAppValue_sc = CFPreferencesCopyAppValue;
     void *cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW);
     if (cf) orig_CFCopySystemVersionDictionary_sc = (CFDictionaryRef (*)(void))dlsym(cf, "CFCopySystemVersionDictionary");
+#if SC_ENABLE_RISKY_APP_HOOKS
     void *cfnet = dlopen("/System/Library/Frameworks/CFNetwork.framework/CFNetwork", RTLD_NOW);
     if (cfnet) orig_CFNetworkCopySystemProxySettings_sc = (CFDictionaryRef (*)(void))dlsym(cfnet, "CFNetworkCopySystemProxySettings");
+#endif
     orig_getifaddrs = getifaddrs;
     orig_if_nametoindex = if_nametoindex;
     orig_if_indextoname = if_indextoname;
@@ -1552,7 +1574,9 @@ static void sc_install_c_rebind_hooks(void) {
     }
     sc_rebind_symbol((void *)CFPreferencesCopyAppValue, (void *)sc_CFPreferencesCopyAppValue_hook);
     if (orig_CFCopySystemVersionDictionary_sc) sc_rebind_symbol((void *)orig_CFCopySystemVersionDictionary_sc, (void *)sc_CFCopySystemVersionDictionary_hook);
+#if SC_ENABLE_RISKY_APP_HOOKS
     if (orig_CFNetworkCopySystemProxySettings_sc) sc_rebind_symbol((void *)orig_CFNetworkCopySystemProxySettings_sc, (void *)sc_CFNetworkCopySystemProxySettings_hook);
+#endif
 }
 
 static void sc_install_objc_hooks(void) {
@@ -1563,8 +1587,10 @@ static void sc_install_objc_hooks(void) {
         sc_hook_objc_method(uiDevice, @selector(localizedModel), (IMP)sc_UIDevice_localizedModel, (IMP *)&orig_UIDevice_localizedModel);
         sc_hook_objc_method(uiDevice, @selector(systemVersion), (IMP)sc_UIDevice_systemVersion, (IMP *)&orig_UIDevice_systemVersion);
         sc_hook_objc_method(uiDevice, @selector(name), (IMP)sc_UIDevice_name, (IMP *)&orig_UIDevice_name);
+#if SC_ENABLE_RISKY_APP_HOOKS
         sc_hook_objc_method(uiDevice, @selector(batteryLevel), (IMP)sc_UIDevice_batteryLevel, (IMP *)&orig_UIDevice_batteryLevel);
         sc_hook_objc_method(uiDevice, @selector(batteryState), (IMP)sc_UIDevice_batteryState, (IMP *)&orig_UIDevice_batteryState);
+#endif
     }
 
     // NSProcessInfo
@@ -1577,6 +1603,7 @@ static void sc_install_objc_hooks(void) {
         sc_hook_objc_method(procInfo, @selector(processorCount), (IMP)sc_NSProcessInfo_processorCount, (IMP *)&orig_NSProcessInfo_processorCount);
     }
 
+#if SC_ENABLE_RISKY_APP_HOOKS
     Class locMgr = objc_getClass("CLLocationManager");
     if (locMgr) {
         sc_hook_objc_method(locMgr, @selector(location), (IMP)sc_CLLocationManager_location, (IMP *)&orig_CLLocationManager_location);
@@ -1595,6 +1622,7 @@ static void sc_install_objc_hooks(void) {
         sc_hook_objc_method(clLoc, @selector(course), (IMP)sc_CLLocation_course, (IMP *)&orig_CLLocation_course);
         sc_hook_objc_method(clLoc, @selector(speed), (IMP)sc_CLLocation_speed, (IMP *)&orig_CLLocation_speed);
     }
+#endif
 
     Class locale = objc_getClass("NSLocale");
     if (locale) {
@@ -1611,6 +1639,7 @@ static void sc_install_objc_hooks(void) {
         sc_hook_objc_class_method(tz, @selector(defaultTimeZone), (IMP)sc_NSTimeZone_defaultTimeZone, (IMP *)&orig_NSTimeZone_defaultTimeZone);
     }
 
+#if SC_ENABLE_RISKY_APP_HOOKS
     Class mutableReq = objc_getClass("NSMutableURLRequest");
     if (mutableReq) {
         sc_hook_objc_method(mutableReq, @selector(setValue:forHTTPHeaderField:), (IMP)sc_NSURLRequest_setValue, (IMP *)&orig_NSURLRequest_setValue);
@@ -1642,6 +1671,7 @@ static void sc_install_objc_hooks(void) {
         sc_hook_objc_method(sf, NSSelectorFromString(@"defaultUserAgentString"), (IMP)sc_SFUserAgent_string, (IMP *)&orig_SFUserAgent_string);
         sc_hook_objc_class_method(sf, NSSelectorFromString(@"defaultUserAgentString"), (IMP)sc_SFUserAgent_class_string, (IMP *)&orig_SFUserAgent_class_string);
     }
+#endif
 
     // NWPath / NWInterface — cellular fake
     Class nwPath = objc_getClass("NWPath");
@@ -1712,8 +1742,12 @@ void iosspoof_system_init(void) {
         if (sym) litehook_hook_function(sym, sc_nw_interface_get_name_hook);
     }
 
-    // ObjC hooks — use method_setImplementation (NOT MSHookFunction)
-    // This is invisible to banking apps — no instruction pattern to detect
-    sc_install_objc_hooks();
-    sc_install_coretelephony_hooks();
+    // ObjC hooks are deferred until the process has initialized Objective-C
+    // frameworks. Installing all ObjC hooks during systemhook load can freeze
+    // sensitive/system processes before their main run loop is ready.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!sc_should_spoof()) return;
+        sc_install_objc_hooks();
+        sc_install_coretelephony_hooks();
+    });
 }
