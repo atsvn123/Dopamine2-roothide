@@ -521,6 +521,11 @@ static bool sc_is_init_denied_process(void) {
            strstr(execPath, "mobile_container_manager") || strstr(execPath, "assertiond") || strstr(execPath, "launchservicesd");
 }
 
+static bool sc_is_armed(void) {
+    return access("/var/jb/var/mobile/Library/Preferences/com.iosspoof.systemhook.arm", F_OK) == 0 ||
+           access("/var/mobile/Library/Preferences/com.iosspoof.systemhook.arm", F_OK) == 0;
+}
+
 static bool sc_bundle_is_targeted(const char *bid) {
     if (!sc_targetBundles || CFArrayGetCount(sc_targetBundles) == 0) {
         // Kernel-level systemhook must never default to global mode. The app must
@@ -1763,6 +1768,7 @@ static void sc_install_objc_hooks(void) {
 
 __attribute__((used, visibility("default")))
 void iosspoof_system_init(void) {
+    if (!sc_is_armed()) return;
     if (!sc_is_app_like_process()) return;
     if (sc_is_init_denied_process()) return;
     if (!sc_kernel_mode_precheck()) return;
