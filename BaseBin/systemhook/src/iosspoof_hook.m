@@ -711,8 +711,8 @@ time_t sc_time_hook(time_t *t) {
     return r;
 }
 
-int (*orig_gettimeofday_sc)(struct timeval *, struct timezone *);
-int sc_gettimeofday_hook(struct timeval *tv, struct timezone *tz) {
+int (*orig_gettimeofday_sc)(struct timeval *restrict, void *restrict);
+int sc_gettimeofday_hook(struct timeval *restrict tv, void *restrict tz) {
     int r = orig_gettimeofday_sc(tv, tz);
     if (r == 0 && sc_should_spoof() && sc_timestamp_offset != 0 && tv) {
         tv->tv_sec += sc_timestamp_offset;
