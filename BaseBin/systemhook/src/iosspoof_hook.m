@@ -37,6 +37,10 @@
 #define SC_ENABLE_RISKY_APP_HOOKS 1
 #endif
 
+#ifndef SC_ENABLE_JAILBREAK_HIDING_HOOKS
+#define SC_ENABLE_JAILBREAK_HIDING_HOOKS 0
+#endif
+
 #if SC_ENABLE_RISKY_APP_HOOKS
 #include <CoreLocation/CoreLocation.h>
 #endif
@@ -1546,7 +1550,7 @@ static void sc_install_c_rebind_hooks(void) {
     orig_if_nametoindex = if_nametoindex;
     orig_if_indextoname = if_indextoname;
 
-    if (sc_hideJailbreak) {
+    if (sc_hideJailbreak && SC_ENABLE_JAILBREAK_HIDING_HOOKS) {
         sc_rebind_symbol((void *)access, (void *)sc_access_hook);
         sc_rebind_symbol((void *)stat, (void *)sc_stat_hook);
         sc_rebind_symbol((void *)lstat, (void *)sc_lstat_hook);
