@@ -496,6 +496,31 @@ static bool sc_is_critical_executable(void) {
            strstr(execPath, "debugserver") || strstr(execPath, "xpcproxy");
 }
 
+static bool sc_is_app_like_process(void) {
+    static char execPath[PATH_MAX];
+    uint32_t size = PATH_MAX;
+    if (_NSGetExecutablePath(execPath, &size) != 0) return false;
+
+    if (strstr(execPath, "/var/containers/Bundle/Application/")) return true;
+    if (strstr(execPath, "/Applications/")) return true;
+    if (strstr(execPath, "/System/Applications/")) return true;
+    if (strstr(execPath, "WebContent") || strstr(execPath, "Networking") || strstr(execPath, "com.apple.WebKit")) return true;
+
+    return false;
+}
+
+static bool sc_is_init_denied_process(void) {
+    static char execPath[PATH_MAX];
+    uint32_t size = PATH_MAX;
+    if (_NSGetExecutablePath(execPath, &size) != 0) return true;
+
+    return strstr(execPath, "Dopamine") || strstr(execPath, "Sileo") || strstr(execPath, "Cydia") ||
+           strstr(execPath, "Zebra") || strstr(execPath, "Installer") || strstr(execPath, "TrollStore") ||
+           strstr(execPath, "SpringBoard") || strstr(execPath, "backboardd") || strstr(execPath, "runningboardd") ||
+           strstr(execPath, "cfprefsd") || strstr(execPath, "lsd") || strstr(execPath, "installd") ||
+           strstr(execPath, "mobile_container_manager") || strstr(execPath, "assertiond") || strstr(execPath, "launchservicesd");
+}
+
 static bool sc_bundle_is_targeted(const char *bid) {
     if (!sc_targetBundles || CFArrayGetCount(sc_targetBundles) == 0) {
         // Kernel-level systemhook must never default to global mode. The app must
@@ -1738,6 +1763,8 @@ static void sc_install_objc_hooks(void) {
 
 __attribute__((used, visibility("default")))
 void iosspoof_system_init(void) {
+    if (!sc_is_app_like_process()) return;
+    if (sc_is_init_denied_process()) return;
     if (!sc_kernel_mode_precheck()) return;
 
     // Marker must be set even when spoofing is disabled, so the companion app
