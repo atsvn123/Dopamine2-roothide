@@ -42,11 +42,13 @@ const char *iosspoof_systemhook_build_marker = "SC_SYSTEMHOOK_ACTIVE:iOSSpoof-sy
 static bool sc_enabled = false;
 static bool sc_kernelMode = false;
 static bool sc_hideJailbreak = true;
+static bool sc_spoofWebKit = false;
 static bool sc_prefsFound = false;
 static CFArrayRef sc_targetBundles = NULL;
 static char sc_productType[64] = "iPhone14,5";
 static char sc_hardwareModel[64] = "D63AP";
 static char sc_marketingName[64] = "iPhone 13";
+static char sc_deviceName[128] = "";
 static char sc_serial[64] = "";
 static char sc_udid[64] = "";
 static char sc_systemVersion[16] = "17.5";
@@ -64,6 +66,7 @@ static char sc_simRadio[2][64] = {"CTRadioAccessTechnologyLTE", "CTRadioAccessTe
 static char sc_simPhone[2][32] = {"", ""};
 static bool sc_simEnabled[2] = {true, false};
 static bool sc_simESIM[2] = {false, true};
+static int sc_activeSIMIndex = 0;
 static int sc_networkMode = 0; // 0=default, 1=wifi, 2=cellular
 static char sc_wifiSSID[128] = "MyWiFi";
 static char sc_wifiBSSID[32] = "02:00:00:00:00:00";
@@ -72,6 +75,7 @@ static char sc_cellularIPv4[32] = "10.23.42.10";
 static char sc_cellularRouter[32] = "10.23.42.1";
 static char sc_locale[32] = "";
 static char sc_timezone[64] = "";
+static long sc_timestamp_offset = 0;
 static bool sc_configLoaded = false;
 static bool sc_hooksInstalled = false;
 
@@ -94,6 +98,49 @@ static NSDictionary *sc_cellular_ipv4_dictionary(void) {
         @"ConfigMethod": @"DHCP",
         @"ConfirmedInterfaceName": @"pdp_ip0"
     };
+}
+
+static NSString *sc_locale_identifier(void) {
+    return sc_locale[0] ? [NSString stringWithUTF8String:sc_locale] : @"en_US";
+}
+
+static NSString *sc_language_tag(void) {
+    return [sc_locale_identifier() stringByReplacingOccurrencesOfString:@"_" withString:@"-"];
+}
+
+static NSString *sc_timezone_identifier(void) {
+    if (sc_timezone[0]) {
+        if (!strcmp(sc_timezone, "Asia/Saigon")) return @"Asia/Ho_Chi_Minh";
+        return [NSString stringWithUTF8String:sc_timezone];
+    }
+    NSString *locale = sc_locale_identifier();
+    if ([locale isEqualToString:@"vi_VN"]) return @"Asia/Ho_Chi_Minh";
+    if ([locale isEqualToString:@"ja_JP"]) return @"Asia/Tokyo";
+    if ([locale isEqualToString:@"ko_KR"]) return @"Asia/Seoul";
+    return @"America/New_York";
+}
+
+static NSArray *sc_preferred_languages(void) {
+    NSString *tag = sc_language_tag();
+    NSString *base = [[tag componentsSeparatedByString:@"-"] firstObject] ?: tag;
+    NSMutableArray *langs = [NSMutableArray arrayWithObjects:tag, base, nil];
+    if (![base isEqualToString:@"en"]) {
+        [langs addObject:@"en-US"];
+        [langs addObject:@"en"];
+    }
+    return langs;
+}
+
+static NSString *sc_accept_language_header(void) {
+    NSString *tag = sc_language_tag();
+    NSString *base = [[tag componentsSeparatedByString:@"-"] firstObject] ?: tag;
+    return [NSString stringWithFormat:@"%@,%@;q=0.9,en-US;q=0.8,en;q=0.7", tag, base];
+}
+
+static NSString *sc_native_user_agent(void) {
+    NSString *version = [NSString stringWithUTF8String:sc_systemVersion[0] ? sc_systemVersion : "17.5"];
+    NSString *v = [version stringByReplacingOccurrencesOfString:@"." withString:@"_"];
+    return [NSString stringWithFormat:@"Mozilla/5.0 (iPhone; CPU iPhone OS %@ like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/%@ Mobile/15E148 Safari/604.1", v, version];
 }
 
 static void sc_set_sockaddr_ipv4(struct sockaddr *addr, const char *ip) {
@@ -168,6 +215,9 @@ static void sc_load_config(void) {
     CFBooleanRef hj = CFDictionaryGetValue(d, CFSTR("hideJailbreak"));
     if (hj) sc_hideJailbreak = CFBooleanGetValue(hj);
 
+    CFBooleanRef wk = CFDictionaryGetValue(d, CFSTR("spoofWebKit"));
+    if (wk) sc_spoofWebKit = CFBooleanGetValue(wk);
+
     CFStringRef pt = CFDictionaryGetValue(d, CFSTR("productType"));
     if (pt) CFStringGetCString(pt, sc_productType, sizeof(sc_productType), kCFStringEncodingUTF8);
 
@@ -176,6 +226,9 @@ static void sc_load_config(void) {
 
     CFStringRef mn = CFDictionaryGetValue(d, CFSTR("marketingName"));
     if (mn) CFStringGetCString(mn, sc_marketingName, sizeof(sc_marketingName), kCFStringEncodingUTF8);
+
+    CFStringRef dn = CFDictionaryGetValue(d, CFSTR("deviceName"));
+    if (dn) CFStringGetCString(dn, sc_deviceName, sizeof(sc_deviceName), kCFStringEncodingUTF8);
 
     CFStringRef sv = CFDictionaryGetValue(d, CFSTR("systemVersion"));
     if (sv) CFStringGetCString(sv, sc_systemVersion, sizeof(sc_systemVersion), kCFStringEncodingUTF8);
@@ -217,6 +270,10 @@ static void sc_load_config(void) {
         }
     }
 
+    CFNumberRef activeSim = CFDictionaryGetValue(d, CFSTR("activeSIMIndex"));
+    if (activeSim) CFNumberGetValue(activeSim, kCFNumberIntType, &sc_activeSIMIndex);
+    if (sc_activeSIMIndex < 0 || sc_activeSIMIndex > 1 || !sc_simEnabled[sc_activeSIMIndex]) sc_activeSIMIndex = 0;
+
     CFNumberRef nm = CFDictionaryGetValue(d, CFSTR("networkMode"));
     if (nm) CFNumberGetValue(nm, kCFNumberIntType, &sc_networkMode);
 
@@ -240,6 +297,10 @@ static void sc_load_config(void) {
 
     CFStringRef tz = CFDictionaryGetValue(d, CFSTR("timezoneIdentifier"));
     if (tz) CFStringGetCString(tz, sc_timezone, sizeof(sc_timezone), kCFStringEncodingUTF8);
+    if (strcmp(sc_timezone, "Asia/Saigon") == 0) strlcpy(sc_timezone, "Asia/Ho_Chi_Minh", sizeof(sc_timezone));
+
+    CFNumberRef ts = CFDictionaryGetValue(d, CFSTR("timestampOffset"));
+    if (ts) CFNumberGetValue(ts, kCFNumberLongType, &sc_timestamp_offset);
 
     // Read target bundles — if empty and enabled, spoof for ALL apps
     CFArrayRef tb = CFDictionaryGetValue(d, CFSTR("targetBundles"));
@@ -267,13 +328,6 @@ static bool sc_is_protected_bundle_id(const char *bid) {
     static const char *protected[] = {
         "com.iosspoof.app",
         "com.apple.springboard",
-        "com.apple.Preferences",
-        "com.apple.mobilesafari",
-        "com.apple.MobileSMS",
-        "com.apple.mobilephone",
-        "com.apple.mobilemail",
-        "com.apple.AppStore",
-        "com.apple.appstore",
         "org.coolstar.SileoStore",
         "org.coolstar.Sileo",
         "com.saurik.Cydia",
@@ -295,7 +349,7 @@ static bool sc_is_critical_executable(void) {
     static char execPath[PATH_MAX];
     uint32_t size = PATH_MAX;
     if (_NSGetExecutablePath(execPath, &size) != 0) return true;
-    return strstr(execPath, "SpringBoard") || strstr(execPath, "Preferences") ||
+    return strstr(execPath, "SpringBoard") ||
            strstr(execPath, "cfprefsd") || strstr(execPath, "lsd") ||
            strstr(execPath, "installd") || strstr(execPath, "backboardd") ||
            strstr(execPath, "runningboardd") || strstr(execPath, "securityd") ||
@@ -316,13 +370,37 @@ static bool sc_bundle_is_targeted(const char *bid) {
     return found;
 }
 
+static bool sc_target_contains_bundle(const char *bid) {
+    if (!bid || !sc_targetBundles || CFArrayGetCount(sc_targetBundles) == 0) return false;
+    CFStringRef bidString = CFStringCreateWithCString(kCFAllocatorDefault, bid, kCFStringEncodingUTF8);
+    if (!bidString) return false;
+    bool found = CFArrayContainsValue(sc_targetBundles, CFRangeMake(0, CFArrayGetCount(sc_targetBundles)), bidString);
+    CFRelease(bidString);
+    return found;
+}
+
+static bool sc_is_webkit_helper_process(const char *bid) {
+    if (bid && strncmp(bid, "com.apple.WebKit", 16) == 0) return true;
+    static char execPath[PATH_MAX];
+    uint32_t size = PATH_MAX;
+    if (_NSGetExecutablePath(execPath, &size) == 0) {
+        return strstr(execPath, "WebContent") || strstr(execPath, "Networking") || strstr(execPath, "com.apple.WebKit");
+    }
+    return false;
+}
+
 // Check if current process should be spoofed
 static bool sc_should_spoof(void) {
     if (!sc_prefsFound || !sc_enabled || !sc_kernelMode) return false;
     if (sc_is_critical_executable()) return false;
 
     char bid[256];
-    if (!sc_copy_current_bundle_id(bid, sizeof(bid))) return false;
+    bool hasBid = sc_copy_current_bundle_id(bid, sizeof(bid));
+    if (!hasBid) bid[0] = '\0';
+    if (sc_is_webkit_helper_process(bid)) {
+        return sc_spoofWebKit && (sc_target_contains_bundle("com.apple.mobilesafari") || sc_target_contains_bundle("com.apple.SafariViewService"));
+    }
+    if (!hasBid) return false;
     if (sc_is_protected_bundle_id(bid)) return false;
     if (!sc_bundle_is_targeted(bid)) return false;
     return true;
@@ -623,8 +701,6 @@ char *sc_realpath_hook(const char *path, char *resolved) {
 // time / gettimeofday — timestamp spoof
 // ============================================================================
 
-static long sc_timestamp_offset = 0;
-
 time_t (*orig_time_sc)(time_t *);
 time_t sc_time_hook(time_t *t) {
     time_t r = orig_time_sc(t);
@@ -642,6 +718,16 @@ int sc_gettimeofday_hook(struct timeval *tv, struct timezone *tz) {
         tv->tv_sec += sc_timestamp_offset;
     }
     return r;
+}
+
+CFPropertyListRef (*orig_CFPreferencesCopyAppValue_sc)(CFStringRef, CFStringRef);
+CFPropertyListRef sc_CFPreferencesCopyAppValue_hook(CFStringRef key, CFStringRef applicationID) {
+    if (sc_should_spoof() && key) {
+        NSString *k = (__bridge NSString *)key;
+        if ([k isEqualToString:@"AppleLanguages"]) return CFBridgingRetain(sc_preferred_languages());
+        if ([k isEqualToString:@"AppleLocale"]) return CFBridgingRetain(sc_locale_identifier());
+    }
+    return orig_CFPreferencesCopyAppValue_sc ? orig_CFPreferencesCopyAppValue_sc(key, applicationID) : NULL;
 }
 
 // ============================================================================
@@ -668,6 +754,12 @@ static NSString *sc_UIDevice_systemVersion(id self, SEL _cmd) {
     return orig_UIDevice_systemVersion(self, _cmd);
 }
 
+static NSString *(*orig_UIDevice_name)(id, SEL);
+static NSString *sc_UIDevice_name(id self, SEL _cmd) {
+    if (sc_should_spoof() && sc_deviceName[0]) return [NSString stringWithUTF8String:sc_deviceName];
+    return orig_UIDevice_name ? orig_UIDevice_name(self, _cmd) : nil;
+}
+
 // NSProcessInfo
 static NSString *(*orig_NSProcessInfo_operatingSystemVersionString)(id, SEL);
 static NSString *sc_NSProcessInfo_operatingSystemVersionString(id self, SEL _cmd) {
@@ -687,6 +779,105 @@ static NSUInteger (*orig_NSProcessInfo_processorCount)(id, SEL);
 static NSUInteger sc_NSProcessInfo_processorCount(id self, SEL _cmd) {
     if (sc_should_spoof()) return 6;
     return orig_NSProcessInfo_processorCount(self, _cmd);
+}
+
+// NSLocale / NSTimeZone
+static NSString *(*orig_NSLocale_localeIdentifier)(id, SEL);
+static NSString *sc_NSLocale_localeIdentifier(id self, SEL _cmd) {
+    if (sc_should_spoof()) return sc_locale_identifier();
+    return orig_NSLocale_localeIdentifier ? orig_NSLocale_localeIdentifier(self, _cmd) : nil;
+}
+
+static NSString *(*orig_NSLocale_countryCode)(id, SEL);
+static NSString *sc_NSLocale_countryCode(id self, SEL _cmd) {
+    if (sc_should_spoof()) {
+        NSArray *parts = [sc_locale_identifier() componentsSeparatedByString:@"_"];
+        if (parts.count >= 2) return parts[1];
+    }
+    return orig_NSLocale_countryCode ? orig_NSLocale_countryCode(self, _cmd) : nil;
+}
+
+static NSString *(*orig_NSLocale_languageCode)(id, SEL);
+static NSString *sc_NSLocale_languageCode(id self, SEL _cmd) {
+    if (sc_should_spoof()) {
+        NSArray *parts = [sc_locale_identifier() componentsSeparatedByString:@"_"];
+        if (parts.count >= 1) return parts[0];
+    }
+    return orig_NSLocale_languageCode ? orig_NSLocale_languageCode(self, _cmd) : nil;
+}
+
+static NSArray *(*orig_NSLocale_preferredLanguages)(id, SEL);
+static NSArray *sc_NSLocale_preferredLanguages(id self, SEL _cmd) {
+    if (sc_should_spoof()) return sc_preferred_languages();
+    return orig_NSLocale_preferredLanguages ? orig_NSLocale_preferredLanguages(self, _cmd) : @[];
+}
+
+static NSTimeZone *(*orig_NSTimeZone_systemTimeZone)(id, SEL);
+static NSTimeZone *sc_NSTimeZone_systemTimeZone(id self, SEL _cmd) {
+    if (sc_should_spoof()) return [NSTimeZone timeZoneWithName:sc_timezone_identifier()];
+    return orig_NSTimeZone_systemTimeZone ? orig_NSTimeZone_systemTimeZone(self, _cmd) : nil;
+}
+
+static NSTimeZone *(*orig_NSTimeZone_localTimeZone)(id, SEL);
+static NSTimeZone *sc_NSTimeZone_localTimeZone(id self, SEL _cmd) {
+    if (sc_should_spoof()) return [NSTimeZone timeZoneWithName:sc_timezone_identifier()];
+    return orig_NSTimeZone_localTimeZone ? orig_NSTimeZone_localTimeZone(self, _cmd) : nil;
+}
+
+static NSTimeZone *(*orig_NSTimeZone_defaultTimeZone)(id, SEL);
+static NSTimeZone *sc_NSTimeZone_defaultTimeZone(id self, SEL _cmd) {
+    if (sc_should_spoof()) return [NSTimeZone timeZoneWithName:sc_timezone_identifier()];
+    return orig_NSTimeZone_defaultTimeZone ? orig_NSTimeZone_defaultTimeZone(self, _cmd) : nil;
+}
+
+// URL request headers. UA spoof is gated by spoofWebKit; language follows locale spoof.
+static void (*orig_NSURLRequest_setValue)(id, SEL, NSString *, NSString *);
+static void sc_NSURLRequest_setValue(id self, SEL _cmd, NSString *value, NSString *field) {
+    if (sc_should_spoof() && [field caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame && sc_spoofWebKit) {
+        orig_NSURLRequest_setValue(self, _cmd, sc_native_user_agent(), field);
+        return;
+    }
+    if (sc_should_spoof() && [field caseInsensitiveCompare:@"Accept-Language"] == NSOrderedSame) {
+        orig_NSURLRequest_setValue(self, _cmd, sc_accept_language_header(), field);
+        return;
+    }
+    orig_NSURLRequest_setValue(self, _cmd, value, field);
+}
+
+static void (*orig_NSURLRequest_setAllHeaders)(id, SEL, NSDictionary *);
+static void sc_NSURLRequest_setAllHeaders(id self, SEL _cmd, NSDictionary *headers) {
+    if (sc_should_spoof()) {
+        NSMutableDictionary *m = [NSMutableDictionary dictionaryWithDictionary:headers ?: @{}];
+        if (sc_spoofWebKit) m[@"User-Agent"] = sc_native_user_agent();
+        m[@"Accept-Language"] = sc_accept_language_header();
+        orig_NSURLRequest_setAllHeaders(self, _cmd, m);
+        return;
+    }
+    orig_NSURLRequest_setAllHeaders(self, _cmd, headers);
+}
+
+static NSDictionary *(*orig_NSURLSessionConfiguration_HTTPAdditionalHeaders)(id, SEL);
+static NSDictionary *sc_NSURLSessionConfiguration_HTTPAdditionalHeaders(id self, SEL _cmd) {
+    NSDictionary *d = orig_NSURLSessionConfiguration_HTTPAdditionalHeaders ? orig_NSURLSessionConfiguration_HTTPAdditionalHeaders(self, _cmd) : nil;
+    if (sc_should_spoof()) {
+        NSMutableDictionary *m = [NSMutableDictionary dictionaryWithDictionary:d ?: @{}];
+        if (sc_spoofWebKit) m[@"User-Agent"] = sc_native_user_agent();
+        m[@"Accept-Language"] = sc_accept_language_header();
+        return m;
+    }
+    return d;
+}
+
+static NSString *(*orig_SFUserAgent_string)(id, SEL);
+static NSString *sc_SFUserAgent_string(id self, SEL _cmd) {
+    if (sc_should_spoof() && sc_spoofWebKit) return sc_native_user_agent();
+    return orig_SFUserAgent_string ? orig_SFUserAgent_string(self, _cmd) : nil;
+}
+
+static NSString *(*orig_SFUserAgent_class_string)(id, SEL);
+static NSString *sc_SFUserAgent_class_string(id self, SEL _cmd) {
+    if (sc_should_spoof() && sc_spoofWebKit) return sc_native_user_agent();
+    return orig_SFUserAgent_class_string ? orig_SFUserAgent_class_string(self, _cmd) : nil;
 }
 
 // NWPath / NWInterface — cellular fake
@@ -1058,7 +1249,7 @@ static NSDictionary *sc_CTTelephony_serviceSubscriberCellularProviders(id self, 
 }
 static NSString *(*orig_CTTelephony_currentRadioAccessTechnology)(id, SEL);
 static NSString *sc_CTTelephony_currentRadioAccessTechnology(id self, SEL _cmd) {
-    if (sc_should_spoof()) return [NSString stringWithUTF8String:sc_simRadio[0]];
+    if (sc_should_spoof()) return [NSString stringWithUTF8String:sc_simRadio[sc_activeSIMIndex]];
     return orig_CTTelephony_currentRadioAccessTechnology ? orig_CTTelephony_currentRadioAccessTechnology(self, _cmd) : nil;
 }
 static NSDictionary *(*orig_CTTelephony_serviceCurrentRadioAccessTechnology)(id, SEL);
@@ -1106,6 +1297,7 @@ static void sc_install_c_rebind_hooks(void) {
     orig_realpath_sc = realpath;
     orig_time_sc = time;
     orig_gettimeofday_sc = gettimeofday;
+    orig_CFPreferencesCopyAppValue_sc = CFPreferencesCopyAppValue;
     orig_getifaddrs = getifaddrs;
     orig_if_nametoindex = if_nametoindex;
     orig_if_indextoname = if_indextoname;
@@ -1136,6 +1328,7 @@ static void sc_install_c_rebind_hooks(void) {
         sc_rebind_symbol((void *)time, (void *)sc_time_hook);
         sc_rebind_symbol((void *)gettimeofday, (void *)sc_gettimeofday_hook);
     }
+    sc_rebind_symbol((void *)CFPreferencesCopyAppValue, (void *)sc_CFPreferencesCopyAppValue_hook);
 }
 
 static void sc_install_objc_hooks(void) {
@@ -1145,6 +1338,7 @@ static void sc_install_objc_hooks(void) {
         sc_hook_objc_method(uiDevice, @selector(model), (IMP)sc_UIDevice_model, (IMP *)&orig_UIDevice_model);
         sc_hook_objc_method(uiDevice, @selector(localizedModel), (IMP)sc_UIDevice_localizedModel, (IMP *)&orig_UIDevice_localizedModel);
         sc_hook_objc_method(uiDevice, @selector(systemVersion), (IMP)sc_UIDevice_systemVersion, (IMP *)&orig_UIDevice_systemVersion);
+        sc_hook_objc_method(uiDevice, @selector(name), (IMP)sc_UIDevice_name, (IMP *)&orig_UIDevice_name);
     }
 
     // NSProcessInfo
@@ -1153,6 +1347,38 @@ static void sc_install_objc_hooks(void) {
         sc_hook_objc_method(procInfo, @selector(operatingSystemVersionString), (IMP)sc_NSProcessInfo_operatingSystemVersionString, (IMP *)&orig_NSProcessInfo_operatingSystemVersionString);
         sc_hook_objc_method(procInfo, @selector(physicalMemory), (IMP)sc_NSProcessInfo_physicalMemory, (IMP *)&orig_NSProcessInfo_physicalMemory);
         sc_hook_objc_method(procInfo, @selector(processorCount), (IMP)sc_NSProcessInfo_processorCount, (IMP *)&orig_NSProcessInfo_processorCount);
+    }
+
+    Class locale = objc_getClass("NSLocale");
+    if (locale) {
+        sc_hook_objc_method(locale, @selector(localeIdentifier), (IMP)sc_NSLocale_localeIdentifier, (IMP *)&orig_NSLocale_localeIdentifier);
+        sc_hook_objc_method(locale, @selector(countryCode), (IMP)sc_NSLocale_countryCode, (IMP *)&orig_NSLocale_countryCode);
+        sc_hook_objc_method(locale, @selector(languageCode), (IMP)sc_NSLocale_languageCode, (IMP *)&orig_NSLocale_languageCode);
+        sc_hook_objc_class_method(locale, @selector(preferredLanguages), (IMP)sc_NSLocale_preferredLanguages, (IMP *)&orig_NSLocale_preferredLanguages);
+    }
+
+    Class tz = objc_getClass("NSTimeZone");
+    if (tz) {
+        sc_hook_objc_class_method(tz, @selector(systemTimeZone), (IMP)sc_NSTimeZone_systemTimeZone, (IMP *)&orig_NSTimeZone_systemTimeZone);
+        sc_hook_objc_class_method(tz, @selector(localTimeZone), (IMP)sc_NSTimeZone_localTimeZone, (IMP *)&orig_NSTimeZone_localTimeZone);
+        sc_hook_objc_class_method(tz, @selector(defaultTimeZone), (IMP)sc_NSTimeZone_defaultTimeZone, (IMP *)&orig_NSTimeZone_defaultTimeZone);
+    }
+
+    Class mutableReq = objc_getClass("NSMutableURLRequest");
+    if (mutableReq) {
+        sc_hook_objc_method(mutableReq, @selector(setValue:forHTTPHeaderField:), (IMP)sc_NSURLRequest_setValue, (IMP *)&orig_NSURLRequest_setValue);
+        sc_hook_objc_method(mutableReq, @selector(setAllHTTPHeaderFields:), (IMP)sc_NSURLRequest_setAllHeaders, (IMP *)&orig_NSURLRequest_setAllHeaders);
+    }
+
+    Class sessionConfig = objc_getClass("NSURLSessionConfiguration");
+    if (sessionConfig) {
+        sc_hook_objc_method(sessionConfig, @selector(HTTPAdditionalHeaders), (IMP)sc_NSURLSessionConfiguration_HTTPAdditionalHeaders, (IMP *)&orig_NSURLSessionConfiguration_HTTPAdditionalHeaders);
+    }
+
+    Class sf = objc_getClass("SFUserAgentController");
+    if (sf) {
+        sc_hook_objc_method(sf, NSSelectorFromString(@"defaultUserAgentString"), (IMP)sc_SFUserAgent_string, (IMP *)&orig_SFUserAgent_string);
+        sc_hook_objc_class_method(sf, NSSelectorFromString(@"defaultUserAgentString"), (IMP)sc_SFUserAgent_class_string, (IMP *)&orig_SFUserAgent_class_string);
     }
 
     // NWPath / NWInterface — cellular fake
