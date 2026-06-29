@@ -235,6 +235,47 @@ static void sc_rebind_symbol(void *replacee, void *replacement) {
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, replacee, replacement, sc_rebind_exception_filter);
 }
 
+static ssize_t sc_read_small_file(const char *path, char *buf, size_t bufSize) {
+    if (!path || !buf || bufSize < 2) return -1;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, bufSize - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+    return n;
+}
+
+static bool sc_plist_bool_value(const char *xml, const char *key) {
+    if (!xml || !key) return false;
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "<key>%s</key>", key);
+    const char *p = strstr(xml, pattern);
+    if (!p) return false;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (!strncmp(p, "<true/>", 7)) return true;
+    return false;
+}
+
+static bool sc_kernel_mode_precheck(void) {
+    const char *paths[] = {
+        "/var/jb/var/mobile/Library/Preferences/com.iosspoof.tweak.plist",
+        "/var/mobile/Library/Preferences/com.iosspoof.tweak.plist",
+        NULL
+    };
+    for (int i = 0; paths[i]; i++) {
+        if (!access(paths[i], F_OK)) {
+            char buf[8192];
+            if (sc_read_small_file(paths[i], buf, sizeof(buf)) <= 0) continue;
+            bool enabled = sc_plist_bool_value(buf, "enabled");
+            bool kernel = sc_plist_bool_value(buf, "kernelMode");
+            if (enabled && kernel) return true;
+        }
+    }
+    return false;
+}
+
 static void sc_load_config(void) {
     if (sc_configLoaded) return;
     sc_configLoaded = true;
@@ -1697,6 +1738,8 @@ static void sc_install_objc_hooks(void) {
 
 __attribute__((used, visibility("default")))
 void iosspoof_system_init(void) {
+    if (!sc_kernel_mode_precheck()) return;
+
     // Marker must be set even when spoofing is disabled, so the companion app
     // can reliably report that the custom systemhook is installed and loaded.
     setenv("SC_SYSTEMHOOK_ACTIVE", "1", 1);
